@@ -111,6 +111,21 @@ export interface ArkadeUnilateralExitEstimate {
   highFeeImpact: boolean
 }
 
+/** Result of preflight checks before Arkade → other-asset swap quotes. */
+export interface ArkadeOnchainSwapEligibility {
+  eligible: boolean
+  code:
+    | 'ok'
+    | 'no_funds'
+    | 'settlement_min_expiry_gap'
+    | 'insufficient_vtxos'
+    | 'amount_too_small'
+    | 'engine_not_started'
+    | 'boltz_unavailable'
+    | 'unknown'
+  message: string
+}
+
 const POLL_MS = 20_000
 const ENGINE_START_WAIT_MS = 12_000
 const ENGINE_START_POLL_MS = 250
@@ -435,6 +450,16 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           throw new Error('Destination must be a Bitcoin onchain address')
         }
         return await this.runUnilateralExitToAddress(destination)
+      },
+
+      /**
+       * Preflight before Arkade → other-asset swap quotes.
+       * Prefers Boltz ARK→BTC (Arkade Wallet path); falls back to ASP settle checks.
+       */
+      arkadeCheckOnchainSwapEligibility: async (params?: {
+        nativeAmount?: string
+      }): Promise<ArkadeOnchainSwapEligibility> => {
+        return await this.checkOnchainSwapEligibility(params?.nativeAmount)
       }
     }
   }
@@ -727,6 +752,20 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
     if (!isBtcOnchainAddress(to)) return this.cachedBalance
 
+    const balance = BigInt(this.cachedBalance)
+    const rawAmount = target.nativeAmount
+    const probeAmount =
+      rawAmount != null && rawAmount !== ''
+        ? Math.abs(Number(rawAmount))
+        : Number(this.cachedBalance)
+
+    // Match Arkade Wallet: prefer Boltz ARK→BTC fee when within limits.
+    const boltz = await this.tryResolveArkToBtcPath(probeAmount)
+    if (boltz != null) {
+      const max = balance - BigInt(boltz.feeSats)
+      return max > BigInt(0) ? max.toString() : '0'
+    }
+
     let feeInfo: unknown
     try {
       const info =
@@ -739,13 +778,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
     const isSwapQuote = spendInfo.savedAction?.actionType === 'swap'
     if (isSwapQuote) {
-      const rawAmount = target.nativeAmount
       const amount =
         rawAmount != null && rawAmount !== ''
           ? BigInt(Math.abs(Number(rawAmount)))
-          : BigInt(this.cachedBalance)
+          : balance
       const outputFee = this.estimateOnchainOutputFee(to, amount, feeInfo)
-      const max = BigInt(this.cachedBalance) - outputFee
+      const max = balance - outputFee
       return max > BigInt(0) ? max.toString() : '0'
     }
 
@@ -859,7 +897,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       )
     }
 
-    // --- Onchain Bitcoin (Ark → BTC via collaborative exit / settle) ---
+    // --- Onchain Bitcoin (Arkade Wallet: Boltz arkToBtc, settle fallback) ---
     if (isBtcOnchainAddress(to)) {
       if (target.nativeAmount == null) {
         const err = new Error('Unable to create zero-amount transaction.')
@@ -876,6 +914,41 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         throw new Error('Insufficient funds')
       }
 
+      const isSwapQuote = spendInfo.savedAction?.actionType === 'swap'
+      const boltz = await this.tryResolveArkToBtcPath(amount)
+
+      if (boltz != null) {
+        if (amount + boltz.feeSats > Number(this.cachedBalance)) {
+          throw new Error('Insufficient funds')
+        }
+        console.warn(
+          `[arkade onchain] makeSpend via Boltz arkToBtc amount=${amount} fee=${boltz.feeSats} to=${to} quote=${isSwapQuote}`
+        )
+        return this.attachSpendInfoMetadata(
+          {
+            blockHeight: 0,
+            currencyCode: arkadeCurrencyInfo.currencyCode,
+            date: Math.floor(Date.now() / 1000),
+            isSend: true,
+            memos: [],
+            nativeAmount: String(-amount),
+            networkFee: String(boltz.feeSats),
+            networkFees: [],
+            otherParams: {
+              paymentType: 'onchain_boltz',
+              to,
+              amount: String(amount)
+            },
+            ourReceiveAddresses: [],
+            signedTx: '',
+            tokenId: null,
+            txid: '',
+            walletId: this.walletInfo.id
+          },
+          spendInfo
+        )
+      }
+
       let feeInfo: unknown
       try {
         const info =
@@ -886,15 +959,13 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         feeInfo = info?.fees
       } catch {}
 
-      const isSwapQuote = spendInfo.savedAction?.actionType === 'swap'
       let outputFee: bigint
-
       if (isSwapQuote) {
         // Quote discovery: many providers call makeSpend in parallel. Do not
         // hit getVtxos / prepareOnchainExit here — that stalls the whole swap UI.
         outputFee = this.estimateOnchainOutputFee(to, BigInt(amount), feeInfo)
         console.warn(
-          `[arkade swap quote] makeSpend onchain fee estimate amount=${amount} fee=${outputFee.toString()} to=${to}`
+          `[arkade swap quote] makeSpend settle fee estimate amount=${amount} fee=${outputFee.toString()} to=${to}`
         )
       } else {
         ;({ outputFee } = await this.prepareOnchainExit(
@@ -978,6 +1049,36 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
 
     try {
+      if (paymentType === 'onchain_boltz') {
+        const result = await this.payOnchainViaBoltz(to, amount)
+        const priorNotes =
+          typeof tx.metadata?.notes === 'string' ? tx.metadata.notes.trim() : ''
+        const boltzNote = `Boltz: ${result.boltzSwapId}`
+        const out: EdgeTransaction = {
+          ...tx,
+          txid: result.txid,
+          metadata: {
+            ...tx.metadata,
+            notes:
+              priorNotes === ''
+                ? boltzNote
+                : priorNotes.includes(result.boltzSwapId)
+                ? priorNotes
+                : `${priorNotes}\n${boltzNote}`
+          },
+          otherParams: {
+            ...(tx.otherParams as object),
+            paymentType: 'onchain_boltz',
+            boltzSwapId: result.boltzSwapId,
+            boltzClaimTxid: result.claimTxid,
+            to,
+            amount: String(amount)
+          }
+        }
+        await this.poll()
+        return out
+      }
+
       if (paymentType === 'onchain') {
         const txid = await this.collaborativeExitToOnchain(to, amount)
         const out: EdgeTransaction = { ...tx, txid }
@@ -995,6 +1096,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           ? error.message
           : typeof error === 'string'
           ? error
+          : paymentType === 'onchain_boltz'
+          ? 'Boltz ARK→BTC swap failed'
           : paymentType === 'onchain'
           ? 'Onchain exit failed'
           : 'Arkade send failed'
@@ -1050,8 +1153,152 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   // ---------------------------------------------------------------------------
 
   /**
-   * Ark → onchain BTC collaborative exit.
+   * Boltz ARK→BTC fee — same formula as Arkade Wallet `calcArkToBtcSwapFee`.
+   */
+  private calcArkToBtcSwapFee(
+    receiverAmountSats: number,
+    fees: {
+      percentage: number
+      minerFees: { server: number; user: { claim: number } }
+    }
+  ): number {
+    const { percentage, minerFees } = fees
+    return Math.ceil(
+      (receiverAmountSats * percentage) / 100 +
+        minerFees.server +
+        minerFees.user.claim
+    )
+  }
+
+  /**
+   * Resolve Boltz chain-swap path when amount is within ARK→BTC limits.
+   * Returns null → caller should fall back to ASP collaborative settle
+   * (same as Arkade Wallet: Boltz first, settle if out of limits / unavailable).
+   */
+  private boltzArkToBtcCache:
+    | {
+        at: number
+        limits: { min: number; max: number }
+        fees: {
+          percentage: number
+          minerFees: { server: number; user: { claim: number } }
+        }
+      }
+    | undefined
+
+  private async tryResolveArkToBtcPath(
+    receiverAmountSats: number
+  ): Promise<{ feeSats: number } | null> {
+    if (
+      this.swaps == null ||
+      !Number.isFinite(receiverAmountSats) ||
+      receiverAmountSats <= 0
+    ) {
+      return null
+    }
+    try {
+      const CACHE_MS = 30_000
+      const now = Date.now()
+      if (
+        this.boltzArkToBtcCache == null ||
+        now - this.boltzArkToBtcCache.at > CACHE_MS
+      ) {
+        const limits = await this.swaps.getLimits('ARK', 'BTC')
+        const fees = await this.swaps.getFees('ARK', 'BTC')
+        if (limits == null || fees?.percentage == null || fees.minerFees == null) {
+          return null
+        }
+        this.boltzArkToBtcCache = {
+          at: now,
+          limits: { min: Number(limits.min), max: Number(limits.max) },
+          fees
+        }
+      }
+
+      const { limits, fees } = this.boltzArkToBtcCache
+      if (limits.max === 0) return null
+      if (receiverAmountSats < limits.min) return null
+      if (limits.max > 0 && receiverAmountSats > limits.max) return null
+
+      return {
+        feeSats: this.calcArkToBtcSwapFee(receiverAmountSats, fees)
+      }
+    } catch (error: unknown) {
+      console.warn(
+        '[arkade] Boltz arkToBtc unavailable, falling back to collaborative exit',
+        error
+      )
+      return null
+    }
+  }
+
+  /**
+   * Arkade Wallet `payBtc`: create chain swap → fund ARK lockup offchain →
+   * wait for Boltz to lock BTC and claim to destination.
    *
+   * Edge txid MUST be the Ark fund tx (matches SDK history). Boltz's
+   * waitForSwapCompletion returns the swap id for chain swaps — never use that
+   * as Edge txid (it creates a duplicate phantom row that vanishes on resync).
+   */
+  private async payOnchainViaBoltz(
+    btcAddress: string,
+    receiverAmountSats: number
+  ): Promise<{
+    txid: string
+    boltzSwapId: string
+    claimTxid: string
+  }> {
+    const swaps = await this.waitForSwapsReady()
+    const wallet = await this.waitForWalletReady()
+
+    const result = await swaps.arkToBtc({
+      btcAddress,
+      receiverLockAmount: receiverAmountSats
+    })
+    if (result?.arkAddress == null || result.amountToPay == null) {
+      throw new Error('Boltz arkToBtc returned incomplete swap details')
+    }
+    const boltzSwapId = String(result.pendingSwap?.id ?? '')
+    if (boltzSwapId === '') {
+      throw new Error('Boltz arkToBtc missing swap id')
+    }
+
+    const fundTxid = String(
+      await wallet.send({
+        address: result.arkAddress,
+        amount: result.amountToPay
+      })
+    )
+    if (fundTxid === '') {
+      throw new Error('Failed to fund Boltz ARK lockup')
+    }
+
+    let claimTxid = ''
+    try {
+      // Blocks until claimed. Return value is the Boltz swap id for chain swaps
+      // — ignore it as a blockchain txid.
+      await swaps.waitAndClaimBtc(result.pendingSwap)
+      try {
+        const status = await swaps.getSwapStatus(boltzSwapId)
+        claimTxid = String(status?.transaction?.id ?? '')
+      } catch {}
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string'
+          ? error
+          : 'Boltz ARK→BTC claim failed'
+      throw new Error(message)
+    }
+
+    return { txid: fundTxid, boltzSwapId, claimTxid }
+  }
+
+  /**
+   * Ark → onchain BTC collaborative exit (ASP settle).
+   *
+   * Fallback when Boltz chain swap is unavailable or amount is outside limits.
    * Do NOT settle with all VTXOs for partial exits: one ineligible input blocks
    * everything. Select only enough VTXOs, preferring
    * those that expire soonest — arkade.computer SettlementMinExpiryGap rejects
@@ -1244,6 +1491,103 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       )
     }
     return eligible
+  }
+
+  private async checkOnchainSwapEligibility(
+    nativeAmount?: string
+  ): Promise<ArkadeOnchainSwapEligibility> {
+    try {
+      await this.waitForWalletReady()
+
+      const amountStr = nativeAmount?.trim()
+      const hasAmount =
+        amountStr != null && amountStr !== '' && amountStr !== '0'
+      const amount = hasAmount ? Number(amountStr) : undefined
+
+      // Prefer Boltz ARK→BTC (same as Arkade Wallet send-to-mainnet).
+      // Offchain lockup avoids ASP SettlementMinExpiryGap.
+      if (amount == null || !Number.isFinite(amount) || amount <= 0) {
+        const boltzProbe = await this.tryResolveArkToBtcPath(
+          Math.max(1, Math.floor(Number(this.cachedBalance) / 2) || 1)
+        )
+        if (boltzProbe != null || this.swaps != null) {
+          // Swaps initialized: typical swap amounts go via Boltz when in limits.
+          // Without a concrete amount, allow quote discovery; makeSpend will
+          // fall back to settle per-quote if out of Boltz limits.
+          try {
+            if (this.swaps != null) {
+              const limits = await this.swaps.getLimits('ARK', 'BTC')
+              if (limits != null && limits.max !== 0) {
+                return { eligible: true, code: 'ok', message: '' }
+              }
+            }
+          } catch {}
+        }
+      } else {
+        const boltz = await this.tryResolveArkToBtcPath(amount)
+        if (boltz != null) {
+          if (amount + boltz.feeSats > Number(this.cachedBalance)) {
+            return {
+              eligible: false,
+              code: 'insufficient_vtxos',
+              message:
+                'Insufficient funds for Boltz ARK→BTC chain swap (amount + fees).'
+            }
+          }
+          return { eligible: true, code: 'ok', message: '' }
+        }
+      }
+
+      // Fallback: ASP collaborative settle eligibility
+      const wallet = await this.waitForWalletReady()
+      await this.getEligibleOnchainExitVtxos(wallet)
+
+      if (hasAmount && amount != null && amount > 0) {
+        const boardingAddress = await wallet.getBoardingAddress()
+        let feeInfo: unknown
+        try {
+          const info =
+            this.cachedAspFees != null
+              ? { fees: this.cachedAspFees }
+              : await wallet.arkProvider?.getInfo?.()
+          if (info?.fees != null) this.cachedAspFees = info.fees
+          feeInfo = info?.fees
+        } catch {}
+
+        await this.prepareOnchainExit(
+          boardingAddress,
+          BigInt(amount),
+          feeInfo
+        )
+      }
+
+      return { eligible: true, code: 'ok', message: '' }
+    } catch (error: unknown) {
+      const message = this.formatOnchainExitError(error)
+      const lower = message.toLowerCase()
+
+      if (/settlementminexpirygap|expiry too far in the future|too fresh/i.test(lower)) {
+        return {
+          eligible: false,
+          code: 'settlement_min_expiry_gap',
+          message
+        }
+      }
+      if (/no funds available/i.test(lower)) {
+        return { eligible: false, code: 'no_funds', message }
+      }
+      if (/insufficient eligible vtxos/i.test(lower)) {
+        return { eligible: false, code: 'insufficient_vtxos', message }
+      }
+      if (/amount too small|too small to cover/i.test(lower)) {
+        return { eligible: false, code: 'amount_too_small', message }
+      }
+      if (/engine not started/i.test(lower)) {
+        return { eligible: false, code: 'engine_not_started', message }
+      }
+
+      return { eligible: false, code: 'unknown', message }
+    }
   }
 
   private async estimateUnilateralExitFees(
@@ -1849,6 +2193,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       (a: any, b: any) => Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0)
     )
 
+    // Boltz ARK→BTC: annotate matching SENT rows with swap id (never use Boltz
+    // id as Edge txid — that created duplicate phantom rows).
+    const boltzByFundTxid = await this.mapBoltzIdsByFundHint(history)
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const bootstrap = !this.historyBootstrapped
     const events = history.map((h: any) => {
@@ -1857,12 +2205,21 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       const boardingTxid = String(h.key?.boardingTxid ?? '')
       const arkTxid = String(h.key?.arkTxid ?? '')
       const commitmentTxid = String(h.key?.commitmentTxid ?? '')
-      const txid = String(
+      let txid = String(
         arkTxid ||
           commitmentTxid ||
           boardingTxid ||
           `ark-${h.type}-${h.createdAt}-${h.amount}`
       )
+      // Defensive: never surface raw Boltz swap ids as Edge txids.
+      if (this.looksLikeBoltzSwapId(txid)) {
+        const fallback = commitmentTxid || boardingTxid
+        if (fallback !== '' && !this.looksLikeBoltzSwapId(fallback)) {
+          txid = fallback
+        } else {
+          txid = `ark-${h.type}-${h.createdAt}-${h.amount}`
+        }
+      }
 
       // Boarding lifecycle (arkade-os/wallet Transaction.tsx):
       // 1) mempool / no createdAt → Unconfirmed (Pending)
@@ -1900,6 +2257,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           ? Math.floor(Date.now() / 1000)
           : Math.floor(createdAtMs / 1000)
 
+      const boltzSwapId =
+        boltzByFundTxid.get(txid) ??
+        boltzByFundTxid.get(arkTxid) ??
+        undefined
+
       const transaction: EdgeTransaction = {
         // Only mempool boarding stays height 0 → Edge "Pending".
         // Confirmed boarding awaiting batch uses height 1 + boarding_pending label.
@@ -1910,6 +2272,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         date: dateSec > 0 ? dateSec : Math.floor(Date.now() / 1000),
         isSend,
         memos: [],
+        metadata:
+          boltzSwapId != null
+            ? { notes: `Boltz: ${boltzSwapId}` }
+            : undefined,
         nativeAmount,
         networkFee: '0',
         networkFees: [],
@@ -1918,7 +2284,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           arkadeStatus,
           settled,
           tag: tag !== '' ? tag : undefined,
-          key: h.key
+          key: h.key,
+          ...(boltzSwapId != null ? { boltzSwapId } : {})
         },
         ourReceiveAddresses: [],
         signedTx: '',
@@ -1940,5 +2307,58 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       // isNew=false and never triggers the in-app receive dropdown.
       this.emitter.emit(EngineEvent.TRANSACTIONS, events)
     }
+  }
+
+  /** Boltz swap ids look like `37XaHp17umws`, not 64-char hex txids. */
+  private looksLikeBoltzSwapId(id: string): boolean {
+    if (id.length < 8 || id.length > 20) return false
+    if (/^[0-9a-fA-F]{64}$/.test(id)) return false
+    return /^[0-9A-Za-z]+$/.test(id)
+  }
+
+  /**
+   * Match completed/pending ARK→BTC chain swaps to history SENT amounts so we
+   * can show the Boltz id on the real Ark fund tx.
+   */
+  private async mapBoltzIdsByFundHint(
+    history: any[]
+  ): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    if (this.swaps == null) return out
+    try {
+      const chainSwaps: any[] =
+        (await this.swaps.getPendingChainSwaps?.()) ?? []
+      let historySwaps: any[] = []
+      try {
+        historySwaps = (await this.swaps.getSwapHistory?.()) ?? []
+      } catch {}
+      const all = [...chainSwaps, ...historySwaps].filter(
+        (s: any) =>
+          s?.type === 'chain' &&
+          s?.request?.from === 'ARK' &&
+          s?.request?.to === 'BTC'
+      )
+      for (const swap of all) {
+        const swapId = String(swap.id ?? '')
+        if (swapId === '') continue
+        const lockAmount = Number(
+          swap.response?.lockupDetails?.amount ?? swap.amount ?? 0
+        )
+        if (!Number.isFinite(lockAmount) || lockAmount <= 0) continue
+        // Prefer SENT rows whose amount matches the lockup.
+        const match = history.find(
+          (h: any) =>
+            h.type === 'SENT' && Number(h.amount) === lockAmount
+        )
+        if (match == null) continue
+        const arkTxid = String(match.key?.arkTxid ?? '')
+        const commitmentTxid = String(match.key?.commitmentTxid ?? '')
+        const txid = arkTxid || commitmentTxid
+        if (txid !== '') out.set(txid, swapId)
+      }
+    } catch (error: unknown) {
+      console.warn('[arkade] mapBoltzIdsByFundHint failed', error)
+    }
+    return out
   }
 }
