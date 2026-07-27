@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "declaration": true,
+    "declarationDir": "lib",
+    "emitDeclarationOnly": true,
+    "sourceRoot": "src",
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "target": "es2017",
+    "skipLibCheck": true,
+
+    "strict": true
+  },
+  "include": ["./edge-currency-plugins.d.ts", "./src/**/*", "./test/**/*"],
+  "exclude": ["./node_modules/**/*", "./lib/**/*"]
+}
