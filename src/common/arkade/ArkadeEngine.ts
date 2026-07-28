@@ -128,7 +128,7 @@ export interface ArkadeOnchainSwapEligibility {
 }
 
 const POLL_MS = 20_000
-const ENGINE_START_WAIT_MS = 12_000
+const ENGINE_START_WAIT_MS = 45_000
 const ENGINE_START_POLL_MS = 250
 
 export class ArkadeEngine implements EdgeCurrencyEngine {
@@ -168,6 +168,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   /** Bearer from session_created (posted with invoices). */
   private lnurlBearerToken: string | undefined
   private lnurlReconnectTimer: ReturnType<typeof setTimeout> | undefined
+  /** Shared in-flight Wallet.create / restore so concurrent syncNetwork calls wait. */
+  private walletInitPromise: Promise<void> | undefined
 
   /**
    * Edge `io.fetch` wrapper passed from the plugin.
@@ -478,6 +480,24 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   ): Promise<any> {
     if (this.wallet != null) return this.wallet
 
+    // Prefer waiting on the in-flight init rather than busy-polling.
+    if (this.walletInitPromise != null) {
+      try {
+        await Promise.race([
+          this.walletInitPromise,
+          new Promise((_resolve, reject) => {
+            setTimeout(
+              () => reject(new Error('Engine not started')),
+              timeoutMs
+            )
+          })
+        ])
+      } catch {
+        // Fall through to final null check below.
+      }
+      if (this.wallet != null) return this.wallet
+    }
+
     const deadline = Date.now() + timeoutMs
     while (this.running && Date.now() < deadline) {
       if (this.wallet != null) return this.wallet
@@ -514,71 +534,103 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
     try {
       if (this.wallet == null) {
-        if (opts.privateKeys == null) return POLL_MS
-        const { mnemonic } = asArkadePrivateKeys(opts.privateKeys)
-        if (mnemonic == null || mnemonic === '') {
-          throw new Error('Missing wallet mnemonic')
-        }
+        if (this.walletInitPromise != null) {
+          await this.walletInitPromise
+        } else if (opts.privateKeys == null) {
+          return POLL_MS
+        } else {
+          const privateKeys = opts.privateKeys
+          this.walletInitPromise = (async () => {
+            const { mnemonic } = asArkadePrivateKeys(privateKeys)
+            if (mnemonic == null || mnemonic === '') {
+              throw new Error('Missing wallet mnemonic')
+            }
 
-        const identity = MnemonicIdentity.fromMnemonic(mnemonic)
+            const identity = MnemonicIdentity.fromMnemonic(mnemonic)
 
-        const arkServerUrl = resolveArkServerUrl(this.settings)
-        const delegatorUrl = resolveDelegatorUrl(this.settings)
+            const arkServerUrl = resolveArkServerUrl(this.settings)
+            const delegatorUrl = resolveDelegatorUrl(this.settings)
 
-        // Avoid IndexedDB / filesystem assumptions: use in-memory repositories.
-        this.wallet = await Wallet.create({
-          identity,
-          walletMode: 'hd',
-          arkServerUrl,
-          ...(delegatorUrl != null
-            ? { delegatorProvider: new RestDelegatorProvider(delegatorUrl) }
-            : {}),
-          storage: {
-            walletRepository: new WalletRepositoryImpl(this.sdkStorage as any),
-            contractRepository: new ArkadeDiskletContractRepository(
-              this.sdkStorage
-            ) as any
-          }
-        })
+            this.wallet = await Wallet.create({
+              identity,
+              walletMode: 'hd',
+              arkServerUrl,
+              ...(delegatorUrl != null
+                ? { delegatorProvider: new RestDelegatorProvider(delegatorUrl) }
+                : {}),
+              storage: {
+                walletRepository: new WalletRepositoryImpl(this.sdkStorage as any),
+                contractRepository: new ArkadeDiskletContractRepository(
+                  this.sdkStorage
+                ) as any
+              }
+            })
 
-        // HD wallets in the newer Arkade SDK recover derived contracts and
-        // advance their watermark through the built-in gap-limit scan.
-        await this.wallet.restore({ gapLimit: 20 })
-        // The receive rotator subscribes lazily on first getVtxoManager().
-        // Without this, the wallet stays functional but keeps showing the same
-        // display address in Edge even after receives.
-        await this.wallet.getVtxoManager()
+            // HD wallets in the newer Arkade SDK recover derived contracts and
+            // advance their watermark through the built-in gap-limit scan.
+            await this.wallet.restore({ gapLimit: 20 })
+            // The receive rotator subscribes lazily on first getVtxoManager().
+            // Without this, the wallet stays functional but keeps showing the same
+            // display address in Edge even after receives.
+            await this.wallet.getVtxoManager()
 
-        // Initialize Boltz swaps with Disklet persistence (no IndexedDB):
-        this.swaps = await ArkadeSwaps.create({
-          wallet: this.wallet,
-          swapRepository: this.swapRepository,
-          swapManager: {
-            enableAutoActions: true,
-            autoStart: true,
-            pollInterval: 30_000
-          }
-        })
+            // HD quirk: first getNextSigningDescriptor() allocates index 0, which is
+            // already the baseline display address. Advance the watermark so the
+            // first post-receive rotate() produces a *new* address instead of a
+            // no-op that only changes after the second payment.
+            try {
+              const provider = (this.wallet as any)?._descriptorProvider
+              if (
+                provider?.getLastIndexUsed != null &&
+                provider?.advanceLastIndexUsed != null
+              ) {
+                const lastIndexUsed = await provider.getLastIndexUsed()
+                if (lastIndexUsed == null) {
+                  await provider.advanceLastIndexUsed(0)
+                }
+              }
+            } catch (error: unknown) {
+              console.warn('[arkade] HD watermark bootstrap failed', error)
+            }
 
-        // Cache receive addresses for Request screen:
-        this.cachedArkadeAddress = await this.wallet.getAddress()
-        this.cachedBoardingAddress = await this.wallet.getBoardingAddress()
+            // Initialize Boltz swaps with Disklet persistence (no IndexedDB):
+            this.swaps = await ArkadeSwaps.create({
+              wallet: this.wallet,
+              swapRepository: this.swapRepository,
+              swapManager: {
+                enableAutoActions: true,
+                autoStart: true,
+                pollInterval: 30_000
+              }
+            })
 
-        // Stable LNURL session token (arkade-os/wallet compatible):
-        this.lnurlSessionToken = deriveLnurlSessionToken(mnemonic, true)
+            // Cache receive addresses for Request screen:
+            this.cachedArkadeAddress = await this.wallet.getAddress()
+            this.cachedBoardingAddress = await this.wallet.getBoardingAddress()
 
-        // Live incoming funds → refresh balance/txs for in-app receive dropdown
-        try {
-          this.stopIncomingNotify = await this.wallet.notifyIncomingFunds(() => {
-            this.poll().catch(() => {})
+            // Stable LNURL session token (arkade-os/wallet compatible):
+            this.lnurlSessionToken = deriveLnurlSessionToken(mnemonic, true)
+
+            // Live incoming funds → refresh balance/txs for in-app receive dropdown
+            try {
+              this.stopIncomingNotify = await this.wallet.notifyIncomingFunds(() => {
+                this.poll().catch(() => {})
+              })
+            } catch {
+              // Optional SDK feature; polling still works.
+            }
+
+            // Keep LNURL SSE alive for the wallet lifetime (not per Receive open):
+            this.ensureLnurlSession().catch(() => {})
+          })().finally(() => {
+            this.walletInitPromise = undefined
           })
-        } catch {
-          // Optional SDK feature; polling still works.
-        }
 
-        // Keep LNURL SSE alive for the wallet lifetime (not per Receive open):
-        this.ensureLnurlSession().catch(() => {})
+          await this.walletInitPromise
+        }
       }
+
+      if (this.wallet == null) return POLL_MS
 
       await this.poll()
       this.emitter.emit(EngineEvent.ADDRESSES_CHECKED, 1)
@@ -597,6 +649,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     this.running = false
     if (this.pollId != null) clearInterval(this.pollId)
     this.pollId = undefined
+    this.walletInitPromise = undefined
 
     try {
       this.stopIncomingNotify?.()
@@ -2447,6 +2500,59 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     })
     this.historyBootstrapped = true
     this.cachedBlockHeight = 1
+
+    // After a new incoming receive, the SDK rotator updates the display
+    // address asynchronously. Wait for that to finish before refreshing the
+    // Edge cache, otherwise Receive can briefly (or sticky) show the old one.
+    //
+    // Important HD quirk: the first rotate() after boot often re-materializes
+    // derivation index 0 (same baseline display address). From the user's
+    // point of view the address only changes after the *second* payment.
+    // If drain left the address unchanged, force one additional exclusive
+    // rotate so Receive advances after the first incoming funds.
+    const hasNewReceive = events.some(
+      e => e.isNew && !e.transaction.isSend && e.transaction.nativeAmount !== '0'
+    )
+    if (hasNewReceive) {
+      try {
+        const rotator = (this.wallet as any)?._receiveRotator
+        const beforeArkade = this.cachedArkadeAddress
+        if (rotator?.drain != null) {
+          await rotator.drain()
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 250))
+        }
+
+        let nextArkadeAddress = await this.wallet.getAddress()
+        if (
+          beforeArkade != null &&
+          nextArkadeAddress === beforeArkade &&
+          rotator?.rotate != null
+        ) {
+          if (rotator.runExclusive != null) {
+            await rotator.runExclusive(() => rotator.rotate(this.wallet))
+          } else {
+            await rotator.rotate(this.wallet)
+          }
+          if (rotator.drain != null) {
+            await rotator.drain()
+          }
+          nextArkadeAddress = await this.wallet.getAddress()
+        }
+
+        const nextBoardingAddress = await this.wallet.getBoardingAddress()
+        if (
+          nextArkadeAddress !== this.cachedArkadeAddress ||
+          nextBoardingAddress !== this.cachedBoardingAddress
+        ) {
+          this.cachedArkadeAddress = nextArkadeAddress
+          this.cachedBoardingAddress = nextBoardingAddress
+          receiveAddressChanged = true
+        }
+      } catch (error: unknown) {
+        console.warn('[arkade] post-receive address refresh failed', error)
+      }
+    }
 
     this.cachedTxs = events.map(e => e.transaction)
     if (events.length > 0) {

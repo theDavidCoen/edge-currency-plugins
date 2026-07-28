@@ -1,5 +1,7 @@
 import { Disklet } from 'disklet'
 
+import { safeArkadeWalletFileId } from './arkadeStoragePaths'
+
 interface Swap {
   id: string
   type?: string
@@ -26,13 +28,21 @@ export class ArkadeDiskletSwapRepository {
   readonly version = 1 as const
 
   private readonly filePath: string
+  private readonly legacyPaths: string[]
   private readonly disklet: Disklet
 
   private queued: Promise<unknown> = Promise.resolve()
 
   constructor(disklet: Disklet, walletId: string) {
     this.disklet = disklet
-    this.filePath = `arkade/${encodeURIComponent(walletId)}/swaps.json`
+    const safeWalletId = safeArkadeWalletFileId(walletId)
+    const encodedWalletId = encodeURIComponent(walletId)
+    this.filePath = `arkade-swaps-${safeWalletId}.json`
+    this.legacyPaths = [
+      `arkade-swaps-${encodedWalletId}.json`,
+      `arkade/${encodedWalletId}/swaps.json`,
+      `arkade/${safeWalletId}/swaps.json`
+    ]
   }
 
   async saveSwap<T extends Swap>(swap: T): Promise<void> {
@@ -85,6 +95,9 @@ export class ArkadeDiskletSwapRepository {
   async clear(): Promise<void> {
     await this.enqueue(async () => {
       await this.disklet.delete(this.filePath).catch(() => {})
+      await Promise.all(
+        this.legacyPaths.map(path => this.disklet.delete(path).catch(() => {}))
+      )
     })
   }
 
@@ -100,12 +113,25 @@ export class ArkadeDiskletSwapRepository {
   }
 
   private async load(): Promise<Record<string, Swap>> {
-    try {
-      const text = await this.disklet.getText(this.filePath)
+    const loadPath = async (path: string): Promise<Record<string, Swap>> => {
+      const text = await this.disklet.getText(path)
       const json = JSON.parse(text)
       if (json == null || typeof json !== 'object') return {}
       return json
+    }
+
+    try {
+      return await loadPath(this.filePath)
     } catch {
+      for (const legacyPath of this.legacyPaths) {
+        try {
+          const data = await loadPath(legacyPath)
+          await this.save(data)
+          return data
+        } catch {
+          // try next legacy path
+        }
+      }
       return {}
     }
   }
@@ -116,6 +142,21 @@ export class ArkadeDiskletSwapRepository {
     for (const [id, swap] of Object.entries(swaps)) {
       if (swap != null) cleaned[id] = swap
     }
-    await this.disklet.setText(this.filePath, JSON.stringify(cleaned))
+    const payload = JSON.stringify(cleaned)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.disklet.setText(this.filePath, payload)
+        return
+      } catch (error: unknown) {
+        if (attempt >= 2) {
+          console.warn(
+            '[arkade] swap-storage disk persist failed; keeping in-memory session state',
+            error
+          )
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)))
+      }
+    }
   }
 }
