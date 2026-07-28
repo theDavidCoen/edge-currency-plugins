@@ -158,7 +158,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private cachedAspFees: any
   private readonly seenTxids = new Set<string>()
   private historyBootstrapped = false
-  private lastAddressAllocationAt = 0
   private stopIncomingNotify: (() => void) | undefined
 
   private lnurlAbort: AbortController | undefined
@@ -529,6 +528,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         // Avoid IndexedDB / filesystem assumptions: use in-memory repositories.
         this.wallet = await Wallet.create({
           identity,
+          walletMode: 'hd',
           arkServerUrl,
           ...(delegatorUrl != null
             ? { delegatorProvider: new RestDelegatorProvider(delegatorUrl) }
@@ -678,14 +678,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       await this.waitForWalletReady(4_000).catch(() => {})
     }
 
-    const now = Date.now()
-    const shouldAllocateFreshReceive =
-      this.wallet != null && now - this.lastAddressAllocationAt > 5_000
-    if (shouldAllocateFreshReceive) {
-      console.warn('[arkade] getAddresses allocating fresh receive addresses')
-      await this.allocateFreshReceiveAddresses(this.wallet).catch(() => {})
-    }
-
     // Arkade offchain address (ark1…):
     let arkade: string | undefined
     if (this.wallet != null) {
@@ -749,7 +741,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     legacyAddress?: string
   }> {
     const wallet = await this.waitForWalletReady()
-    await this.allocateFreshReceiveAddresses(wallet)
     const arkade = await wallet.getAddress()
     const boarding = await wallet.getBoardingAddress()
 
@@ -761,60 +752,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       // Map boarding → segwitAddress so older UI paths still expose onchain BTC
       segwitAddress: boarding
     }
-  }
-
-  private async allocateFreshReceiveAddresses(wallet: any): Promise<void> {
-    const beforeArkade = await wallet.getAddress().catch(() => undefined)
-    const beforeBoarding = await wallet
-      .getBoardingAddress()
-      .catch(() => undefined)
-    try {
-      const provider = wallet?._descriptorProvider
-      if (provider?.getLastIndexUsed != null && provider?.advanceLastIndexUsed != null) {
-        const lastIndexUsed = await provider.getLastIndexUsed()
-        if (lastIndexUsed == null) {
-          await provider.advanceLastIndexUsed(0)
-        }
-      }
-
-      const rotator = wallet?._receiveRotator
-      if (rotator?.rotate != null) {
-        if (rotator?.runExclusive != null) {
-          await rotator.runExclusive(() => rotator.rotate(wallet))
-        } else {
-          await rotator.rotate(wallet)
-        }
-        const afterFirstRotate = await wallet.getAddress().catch(() => undefined)
-        if (beforeArkade != null && afterFirstRotate === beforeArkade) {
-          if (rotator?.runExclusive != null) {
-            await rotator.runExclusive(() => rotator.rotate(wallet))
-          } else {
-            await rotator.rotate(wallet)
-          }
-        }
-      }
-    } catch (error: unknown) {
-      console.warn('[arkade] receive rotation failed', error)
-    }
-
-    try {
-      if (wallet.getNewBoardingAddress != null) {
-        await wallet.getNewBoardingAddress()
-      }
-    } catch (error: unknown) {
-      console.warn('[arkade] boarding rotation failed', error)
-    }
-
-    this.cachedArkadeAddress = await wallet.getAddress()
-    this.cachedBoardingAddress = await wallet.getBoardingAddress()
-    console.warn('[arkade] receive address allocation result', {
-      beforeArkade,
-      afterArkade: this.cachedArkadeAddress,
-      beforeBoarding,
-      afterBoarding: this.cachedBoardingAddress
-    })
-    this.lastAddressAllocationAt = Date.now()
-    this.onAddressChanged?.()
   }
 
   async addGapLimitAddresses(): Promise<void> {}
@@ -2510,29 +2447,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     })
     this.historyBootstrapped = true
     this.cachedBlockHeight = 1
-
-    const hasNewReceive = events.some(
-      e => e.isNew && !e.transaction.isSend && e.transaction.nativeAmount !== '0'
-    )
-    if (hasNewReceive) {
-      try {
-        const rotator = (this.wallet as any)?._receiveRotator
-        if (rotator?.rotate != null) {
-          if (rotator?.runExclusive != null) {
-            await rotator.runExclusive(() => rotator.rotate(this.wallet))
-          } else {
-            await rotator.rotate(this.wallet)
-          }
-          const nextArkadeAddress = await this.wallet.getAddress()
-          if (nextArkadeAddress !== this.cachedArkadeAddress) {
-            this.cachedArkadeAddress = nextArkadeAddress
-            receiveAddressChanged = true
-          }
-        }
-      } catch (error: unknown) {
-        console.warn('[arkade] manual receive rotation failed', error)
-      }
-    }
 
     this.cachedTxs = events.map(e => e.transaction)
     if (events.length > 0) {

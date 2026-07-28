@@ -6,11 +6,11 @@ Arkade HD receive address does not rotate in Edge integration when using `Mnemon
 
 ## Summary
 
-We are integrating Arkade into Edge and are seeing a persistent issue with HD receive address rotation.
+We initially saw a persistent HD receive rotation issue in the Edge integration.
 
-An Arkade wallet created from `MnemonicIdentity` always returns the same offchain receive address in the Edge receive flow, even after successful receives and repeated openings of the receive screen.
+The issue was resolved after explicitly setting `walletMode: 'hd'` in `Wallet.create(...)`. With that change, the receive address stays stable while simply viewing the receive screen, and rotates after funds are actually received.
 
-## Observed Behavior
+## Initial Observed Behavior
 
 The copied Arkade receive address remains identical across repeated tests.
 
@@ -39,6 +39,7 @@ We are using:
 - `Wallet.create(...)`
 - persistent `WalletRepositoryImpl`
 - persistent custom `ContractRepository`
+- explicit `walletMode: 'hd'`
 - `wallet.restore({ gapLimit: 20 })`
 - `await wallet.getVtxoManager()` during startup to ensure the receive rotator installs
 
@@ -72,32 +73,36 @@ We tested multiple layers:
 - Patched SDK `getAddress()` to prefer the newest active `wallet-receive` contract from `contractRepository`
 - Also tried forcing address materialization from inside `getAddress()`
 
-None of the above changed the returned receive address.
+None of the above changed the returned receive address while the wallet was still using the default/auto wallet-mode path.
 
-## Narrowed Root-Cause Area
+## Root Cause
 
-At this point the issue appears to be deeper than address selection or UI caching.
+In this integration path, relying on the default/auto wallet mode was not enough to get the expected HD receive behavior.
 
-The most likely root-cause area is one of these:
+Even though we were using `MnemonicIdentity`, persistent repositories, `restore({ gapLimit })`, and `getVtxoManager()`, the receive address stayed stuck on the same baseline address until we explicitly set:
 
-1. `WalletReceiveRotator.rotate()` is not actually persisting a new HD receive contract for this wallet state
-2. `HDDescriptorProvider.getNextSigningDescriptor()` is not advancing beyond the baseline flow in this real integration path
-3. Boot / reconstruction is not syncing runtime wallet state with persisted receive contracts
-4. `MnemonicIdentity` plus the current wallet mode path is not enabling the HD receive flow we expect
+`walletMode: 'hd'`
+
+Once we did that, the behavior matched expectations:
+
+- the address no longer rotated just by opening or viewing `Receive`
+- the address rotated after actual incoming funds were received
 
 ## Most Relevant Symptom
 
-Even when we patched `wallet.getAddress()` to read the newest active `wallet-receive` contract from the repository, the returned address still did not change.
+The wallet looked effectively non-HD under the default/auto path:
 
-That suggests either:
+- repeated `Receive -> Copy` returned the same Arkade address
+- forcing address refresh from the Edge side did not help
+- several aggressive workarounds only caused unwanted rotation on UI reads, not the desired “rotate on incoming funds” behavior
 
-- no newer tagged receive contract is being created or persisted, or
-- the contracts being created are not actually different receive addresses
+The decisive change was making HD mode explicit in `Wallet.create(...)`.
 
 ## Suggested Investigation Points
 
 Please inspect these paths together:
 
+- wallet-mode resolution when `MnemonicIdentity` is used under the default/auto path
 - `HDDescriptorProvider.getNextSigningDescriptor()`
 - `WalletReceiveRotator.defaultBoot()`
 - `WalletReceiveRotator.rotate()`
@@ -110,7 +115,9 @@ Please inspect these paths together:
 
 ## Practical Conclusion
 
-From the Edge side, we were not able to obtain rotating Arkade receive addresses despite:
+From the Edge side, we were not able to obtain correct rotating receive behavior until HD mode was made explicit.
+
+Before that, we tried:
 
 - HD identity
 - persistent repositories
@@ -119,4 +126,10 @@ From the Edge side, we were not able to obtain rotating Arkade receive addresses
 - direct rotator invocation
 - SDK-level address-selection patches
 
-So this currently looks like an SDK-side HD receive rotation bug or an SDK/runtime expectation mismatch.
+The final working fix on our side was:
+
+- `walletMode: 'hd'` in `Wallet.create(...)`
+- no read-path rotation hacks
+- let the SDK rotate on actual incoming funds
+
+This suggests a wallet-mode resolution mismatch or SDK expectation gap in the default/auto path, rather than a fundamental failure of HD receive rotation itself.
