@@ -378,11 +378,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       },
 
       /**
-       * Exit all spendable VTXOs of this wallet to an onchain BTC address.
+       * Collaborative settle/offboard: exit spendable VTXOs to an onchain BTC
+       * address while the ASP is online (`wallet.settle`).
        *
-       * Working path: collaborative settle (ASP online).
-       * True unilateral Unroll.Session (ASP-independent, CSV challenge) is not
-       * automated here — needs an onchain fee bumper + multi-step waits.
+       * For ASP-independent Unroll + CSV sweep, use
+       * `arkadeUnilateralExitToAddress` instead.
        */
       arkadeOffboardToAddress: async (
         destination: string
