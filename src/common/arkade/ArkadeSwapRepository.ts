@@ -32,7 +32,7 @@ export class ArkadeDiskletSwapRepository {
 
   constructor(disklet: Disklet, walletId: string) {
     this.disklet = disklet
-    this.filePath = `arkade/${walletId}/swaps.json`
+    this.filePath = `arkade/${encodeURIComponent(walletId)}/swaps.json`
   }
 
   async saveSwap<T extends Swap>(swap: T): Promise<void> {

@@ -72,12 +72,6 @@ module.exports = {
     })
   ],
   resolve: {
-    alias: {
-      '@arkade-tx-size-estimator': path.resolve(
-        __dirname,
-        'node_modules/@arkade-os/sdk/dist/cjs/utils/txSizeEstimator.js'
-      )
-    },
     aliasFields: ['browser'],
     extensions: ['.ts', '.js'],
     fallback: {

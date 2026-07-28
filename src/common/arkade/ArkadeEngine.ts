@@ -2,15 +2,15 @@ import { ArkadeSwaps, decodeInvoice, isValidArkAddress } from '@arkade-os/boltz-
 import {
   ChainTxType,
   Estimator,
-  InMemoryContractRepository,
-  InMemoryWalletRepository,
   MnemonicIdentity,
   OnchainWallet,
   RestDelegatorProvider,
   Transaction,
+  TxWeightEstimator,
   Unroll,
   VHTLC,
   VtxoScript,
+  WalletRepositoryImpl,
   Wallet,
   networks
 } from '@arkade-os/sdk'
@@ -40,9 +40,10 @@ import {
   resolveDelegatorUrl
 } from './arkadeInfo'
 import { deriveLnurlSessionToken } from './arkadeLnurl'
+import { ArkadeDiskletContractRepository } from './ArkadeDiskletContractRepository'
+import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
 import { asArkadePrivateKeys, isBolt11Invoice, isBtcOnchainAddress } from './arkadeTools'
-import { TxWeightEstimator } from '@arkade-tx-size-estimator'
 
 type ArkadeDelayType = 'blocks' | 'seconds'
 
@@ -157,6 +158,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private cachedAspFees: any
   private readonly seenTxids = new Set<string>()
   private historyBootstrapped = false
+  private lastAddressAllocationAt = 0
   private stopIncomingNotify: (() => void) | undefined
 
   private lnurlAbort: AbortController | undefined
@@ -183,7 +185,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     io: { fetch: (uri: string, init?: any) => Promise<any> },
     settings: ArkadeSettings,
-    private readonly swapRepository: ArkadeDiskletSwapRepository
+    private readonly swapRepository: ArkadeDiskletSwapRepository,
+    private readonly sdkStorage: ArkadeDiskletSdkStorage
   ) {
     this.walletInfo = walletInfo
     this.settings = settings
@@ -531,10 +534,20 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
             ? { delegatorProvider: new RestDelegatorProvider(delegatorUrl) }
             : {}),
           storage: {
-            walletRepository: new InMemoryWalletRepository(),
-            contractRepository: new InMemoryContractRepository()
+            walletRepository: new WalletRepositoryImpl(this.sdkStorage as any),
+            contractRepository: new ArkadeDiskletContractRepository(
+              this.sdkStorage
+            ) as any
           }
         })
+
+        // HD wallets in the newer Arkade SDK recover derived contracts and
+        // advance their watermark through the built-in gap-limit scan.
+        await this.wallet.restore({ gapLimit: 20 })
+        // The receive rotator subscribes lazily on first getVtxoManager().
+        // Without this, the wallet stays functional but keeps showing the same
+        // display address in Edge even after receives.
+        await this.wallet.getVtxoManager()
 
         // Initialize Boltz swaps with Disklet persistence (no IndexedDB):
         this.swaps = await ArkadeSwaps.create({
@@ -665,15 +678,25 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       await this.waitForWalletReady(4_000).catch(() => {})
     }
 
+    const now = Date.now()
+    const shouldAllocateFreshReceive =
+      this.wallet != null && now - this.lastAddressAllocationAt > 5_000
+    if (shouldAllocateFreshReceive) {
+      console.warn('[arkade] getAddresses allocating fresh receive addresses')
+      await this.allocateFreshReceiveAddresses(this.wallet).catch(() => {})
+    }
+
     // Arkade offchain address (ark1…):
-    let arkade =
-      this.cachedArkadeAddress ??
-      (typeof this.walletInfo.keys.publicKey === 'string'
-        ? this.walletInfo.keys.publicKey
-        : undefined)
-    if (arkade == null && this.wallet != null) {
+    let arkade: string | undefined
+    if (this.wallet != null) {
       arkade = await this.wallet.getAddress()
       this.cachedArkadeAddress = arkade
+    } else {
+      arkade =
+        this.cachedArkadeAddress ??
+        (typeof this.walletInfo.keys.publicKey === 'string'
+          ? this.walletInfo.keys.publicKey
+          : undefined)
     }
     if (arkade != null && arkade !== '') {
       addresses.push({
@@ -683,10 +706,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
 
     // Onchain boarding address (bc1p…):
-    let boarding = this.cachedBoardingAddress
-    if (boarding == null && this.wallet != null) {
+    let boarding: string | undefined
+    if (this.wallet != null) {
       boarding = await this.wallet.getBoardingAddress()
       this.cachedBoardingAddress = boarding
+    } else {
+      boarding = this.cachedBoardingAddress
     }
     if (boarding != null && boarding !== '') {
       // boardingAddress for Request UI; segwitAddress so swap getAddress() prefers
@@ -723,16 +748,73 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     segwitAddress?: string
     legacyAddress?: string
   }> {
-    const addresses = await this.getAddresses()
-    const arkade = addresses.find(a => a.addressType === 'publicAddress')
-    const boarding = addresses.find(a => a.addressType === 'boardingAddress')
-    if (arkade == null) throw new Error('Engine not started')
+    const wallet = await this.waitForWalletReady()
+    await this.allocateFreshReceiveAddresses(wallet)
+    const arkade = await wallet.getAddress()
+    const boarding = await wallet.getBoardingAddress()
+
+    this.cachedArkadeAddress = arkade
+    this.cachedBoardingAddress = boarding
     return {
       // Primary QR: Arkade offchain address
-      publicAddress: arkade.publicAddress,
+      publicAddress: arkade,
       // Map boarding → segwitAddress so older UI paths still expose onchain BTC
-      segwitAddress: boarding?.publicAddress
+      segwitAddress: boarding
     }
+  }
+
+  private async allocateFreshReceiveAddresses(wallet: any): Promise<void> {
+    const beforeArkade = await wallet.getAddress().catch(() => undefined)
+    const beforeBoarding = await wallet
+      .getBoardingAddress()
+      .catch(() => undefined)
+    try {
+      const provider = wallet?._descriptorProvider
+      if (provider?.getLastIndexUsed != null && provider?.advanceLastIndexUsed != null) {
+        const lastIndexUsed = await provider.getLastIndexUsed()
+        if (lastIndexUsed == null) {
+          await provider.advanceLastIndexUsed(0)
+        }
+      }
+
+      const rotator = wallet?._receiveRotator
+      if (rotator?.rotate != null) {
+        if (rotator?.runExclusive != null) {
+          await rotator.runExclusive(() => rotator.rotate(wallet))
+        } else {
+          await rotator.rotate(wallet)
+        }
+        const afterFirstRotate = await wallet.getAddress().catch(() => undefined)
+        if (beforeArkade != null && afterFirstRotate === beforeArkade) {
+          if (rotator?.runExclusive != null) {
+            await rotator.runExclusive(() => rotator.rotate(wallet))
+          } else {
+            await rotator.rotate(wallet)
+          }
+        }
+      }
+    } catch (error: unknown) {
+      console.warn('[arkade] receive rotation failed', error)
+    }
+
+    try {
+      if (wallet.getNewBoardingAddress != null) {
+        await wallet.getNewBoardingAddress()
+      }
+    } catch (error: unknown) {
+      console.warn('[arkade] boarding rotation failed', error)
+    }
+
+    this.cachedArkadeAddress = await wallet.getAddress()
+    this.cachedBoardingAddress = await wallet.getBoardingAddress()
+    console.warn('[arkade] receive address allocation result', {
+      beforeArkade,
+      afterArkade: this.cachedArkadeAddress,
+      beforeBoarding,
+      afterBoarding: this.cachedBoardingAddress
+    })
+    this.lastAddressAllocationAt = Date.now()
+    this.onAddressChanged?.()
   }
 
   async addGapLimitAddresses(): Promise<void> {}
@@ -818,6 +900,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     const to = target.publicAddress
     if (to == null || to === '') throw new Error('Missing publicAddress')
 
+    // Arkade sends can otherwise reach the confirm slider before the SDK wallet
+    // is initialized, then fail later in broadcastTx with "Engine not started".
+    await this.waitForWalletReady()
+
     // --- Lightning invoice (Boltz submarine swap) ---
     if (isBolt11Invoice(to)) {
       await this.waitForSwapsReady()
@@ -830,6 +916,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         throw new Error('Amount required for this Lightning invoice')
       }
       if (amount > Number(this.cachedBalance)) {
+        throw new Error('Insufficient funds')
+      }
+      const lightningFee = await this.tryEstimateLightningFee(amount)
+      if (amount + lightningFee > Number(this.cachedBalance)) {
         throw new Error('Insufficient funds')
       }
 
@@ -845,7 +935,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
               ? { name: decoded.description }
               : undefined,
           nativeAmount: String(-amount),
-          networkFee: '0',
+          networkFee: String(lightningFee),
           networkFees: [],
           otherParams: {
             paymentType: 'lightning',
@@ -1086,7 +1176,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         return out
       }
 
-      const arkTxId = await wallet.send({ address: to, amount })
+      const arkTxId = await this.sendOffchainWithRecovery(wallet, {
+        address: to,
+        amount
+      })
       const out: EdgeTransaction = { ...tx, txid: arkTxId }
       await this.poll()
       return out
@@ -1168,6 +1261,98 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         minerFees.server +
         minerFees.user.claim
     )
+  }
+
+  private calcLightningSubmarineFee(
+    amountSats: number,
+    fees: {
+      percentage: number
+      minerFees: number
+    }
+  ): number {
+    return Math.ceil((amountSats * fees.percentage) / 100 + fees.minerFees)
+  }
+
+  private async tryEstimateLightningFee(amountSats: number): Promise<number> {
+    if (
+      this.swaps == null ||
+      !Number.isFinite(amountSats) ||
+      amountSats <= 0
+    ) {
+      return 0
+    }
+    try {
+      const fees = await this.swaps.getFees()
+      if (fees?.submarine == null) return 0
+      return this.calcLightningSubmarineFee(amountSats, fees.submarine)
+    } catch {
+      return 0
+    }
+  }
+
+  private async sendOffchainWithRecovery(
+    wallet: any,
+    params: { address: string; amount: number },
+    timeoutMs: number = 45_000
+  ): Promise<string> {
+    try {
+      await wallet.finalizePendingTxs?.()
+    } catch (error: unknown) {
+      console.warn('[arkade] finalizePendingTxs before send failed', error)
+    }
+
+    return await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            'Arkade send timed out while waiting for the operator to finalize the transaction'
+          )
+        )
+      }, timeoutMs)
+
+      wallet
+        .send(params)
+        .then((txid: unknown) => {
+          clearTimeout(timer)
+          resolve(String(txid ?? ''))
+        })
+        .catch((error: unknown) => {
+          clearTimeout(timer)
+          reject(error)
+        })
+    })
+  }
+
+  private async getCachedSdkVtxos(wallet: any): Promise<any[]> {
+    try {
+      const address = await wallet.getAddress()
+      const cached = await wallet.walletRepository?.getVtxos?.(address)
+      return Array.isArray(cached) ? cached : []
+    } catch {
+      return []
+    }
+  }
+
+  private async getCachedSdkHistory(wallet: any): Promise<any[]> {
+    try {
+      const address = await wallet.getAddress()
+      const cached = await wallet.walletRepository?.getTransactionHistory?.(address)
+      return Array.isArray(cached) ? cached : []
+    } catch {
+      return []
+    }
+  }
+
+  private async getFallbackBalance(wallet: any): Promise<string> {
+    const vtxos = await this.getCachedSdkVtxos(wallet)
+    let total = 0
+    for (const vtxo of vtxos) {
+      if (vtxo?.isSpent === true) continue
+      const state = String(vtxo?.virtualStatus?.state ?? '')
+      if (state === 'swept') continue
+      total += Number(vtxo?.value ?? 0)
+    }
+    return String(total)
   }
 
   /**
@@ -2100,6 +2285,23 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private async poll(): Promise<void> {
     if (!this.running || this.wallet == null) return
 
+    let receiveAddressChanged = false
+    try {
+      const [nextArkadeAddress, nextBoardingAddress] = await Promise.all([
+        this.wallet.getAddress(),
+        this.wallet.getBoardingAddress()
+      ])
+      receiveAddressChanged =
+        nextArkadeAddress !== this.cachedArkadeAddress ||
+        nextBoardingAddress !== this.cachedBoardingAddress
+      this.cachedArkadeAddress = nextArkadeAddress
+      this.cachedBoardingAddress = nextBoardingAddress
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : String(error)
+      console.warn(`[arkade] refresh receive addresses failed: ${message}`)
+    }
+
     // Fetch independently so a history failure does not leave balance stuck
     // at 0 after killEngine / app restart (InMemory repo rebuild).
     let balance: {
@@ -2115,7 +2317,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       const message =
         error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] getBalance failed: ${message}`)
-      throw error
+      const fallbackBalance = await this.getFallbackBalance(this.wallet)
+      if (fallbackBalance !== '0') {
+        balance = { available: fallbackBalance, total: fallbackBalance }
+      } else {
+        throw error
+      }
     }
 
     // Prefer total (offchain + boarding + recoverable), matching arkade-os/wallet.
@@ -2146,7 +2353,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       const message =
         error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] getTransactionHistory failed: ${message}`)
-      history = []
+      history = await this.getCachedSdkHistory(this.wallet)
     }
 
     // Balance uses getBoardingUtxos/getCoins; history uses getTransactions which
@@ -2163,6 +2370,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         const txid = String(utxo.txid ?? '')
         if (txid === '' || knownBoarding.has(txid)) continue
         const confirmed = utxo.status?.confirmed === true
+        // Once the boarding tx is confirmed, rely on SDK history. Synthesizing
+        // a second row here causes a duplicate "Pending boarding" entry.
+        if (confirmed) continue
         const blockTime = Number(utxo.status?.block_time ?? 0)
         history.push({
           key: {
@@ -2301,11 +2511,39 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     this.historyBootstrapped = true
     this.cachedBlockHeight = 1
 
+    const hasNewReceive = events.some(
+      e => e.isNew && !e.transaction.isSend && e.transaction.nativeAmount !== '0'
+    )
+    if (hasNewReceive) {
+      try {
+        const rotator = (this.wallet as any)?._receiveRotator
+        if (rotator?.rotate != null) {
+          if (rotator?.runExclusive != null) {
+            await rotator.runExclusive(() => rotator.rotate(this.wallet))
+          } else {
+            await rotator.rotate(this.wallet)
+          }
+          const nextArkadeAddress = await this.wallet.getAddress()
+          if (nextArkadeAddress !== this.cachedArkadeAddress) {
+            this.cachedArkadeAddress = nextArkadeAddress
+            receiveAddressChanged = true
+          }
+        }
+      } catch (error: unknown) {
+        console.warn('[arkade] manual receive rotation failed', error)
+      }
+    }
+
     this.cachedTxs = events.map(e => e.transaction)
     if (events.length > 0) {
       // Must use TRANSACTIONS (with isNew) — TRANSACTIONS_CHANGED forces
       // isNew=false and never triggers the in-app receive dropdown.
       this.emitter.emit(EngineEvent.TRANSACTIONS, events)
+    }
+    if (receiveAddressChanged) {
+      try {
+        this.onAddressChanged?.()
+      } catch {}
     }
   }
 

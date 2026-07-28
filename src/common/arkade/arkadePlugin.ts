@@ -9,6 +9,7 @@ import {
 
 import { ArkadeEngine } from './ArkadeEngine'
 import { arkadeCurrencyInfo, asArkadeSettings } from './arkadeInfo'
+import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
 import { makeArkadeTools } from './arkadeTools'
 
@@ -38,6 +39,7 @@ export function makeArkadePlugin(
         walletDisklet,
         walletInfo.id
       )
+      const sdkStorage = new ArkadeDiskletSdkStorage(walletDisklet, walletInfo.id)
       return new ArkadeEngine(
         walletInfo,
         engineOptions,
@@ -48,7 +50,8 @@ export function makeArkadePlugin(
           fetch: (uri: string, init?: any) => (io.fetch as any)(uri, init)
         },
         settings,
-        swapRepository
+        swapRepository,
+        sdkStorage
       )
     },
 

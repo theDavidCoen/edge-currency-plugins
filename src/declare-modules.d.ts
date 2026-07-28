@@ -25,6 +25,10 @@ declare module '@arkade-os/sdk' {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   export const VHTLC: any
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  export const WalletRepositoryImpl: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  export const ContractRepositoryImpl: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   export const InMemoryWalletRepository: any
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   export const InMemoryContractRepository: any
