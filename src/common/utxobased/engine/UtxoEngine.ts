@@ -25,6 +25,10 @@ import {
   isEvmAddress,
   quoteChainSwapFee
 } from '../../boltz/boltzChainSwap'
+import {
+  ParmesanSwapRecord,
+  startBoltzSwapMonitor
+} from '../../boltz/boltzSwapMonitor'
 import { makeFees } from '../../fees/makeFees'
 import { EngineEmitter, EngineEvent } from '../../plugin/EngineEmitter'
 import { makeMetadata } from '../../plugin/Metadata'
@@ -164,6 +168,9 @@ export async function makeUtxoEngine(
     walletTools,
     walletInfo
   })
+
+  // Parmesan: stop function for the Boltz swap monitor; replaced on startEngine.
+  let stopSwapMonitor: () => void = () => undefined
 
   const engine: EdgeCurrencyEngine = {
     async accelerate(edgeTx: EdgeTransaction): Promise<EdgeTransaction | null> {
@@ -389,9 +396,33 @@ export async function makeUtxoEngine(
       pluginState.addEngine(engineProcessor)
       await fees.start()
       await engineProcessor.start()
+
+      // Parmesan: silent Boltz swap monitor (BTC→RBTC pending swaps only).
+      if (currencyInfo.pluginId === 'bitcoin') {
+        stopSwapMonitor = startBoltzSwapMonitor(
+          walletLocalDisklet,
+          io.fetch,
+          {
+            onSwapCompleted(swap: ParmesanSwapRecord) {
+              log.warn(
+                `[Parmesan] BTC→RBTC swap ${swap.id} completed — RBTC delivered to ${String(swap.claimAddress ?? '')}`
+              )
+            },
+            onSwapRefundNeeded(swap: ParmesanSwapRecord) {
+              log.warn(
+                `[Parmesan] BTC→RBTC swap ${swap.id} expired — refund required. ` +
+                  `Use refundPublicKey at m/${String(privateKeyFormat)}/0/0 to claim back ${String(swap.amount ?? '')} sats. ` +
+                  `No refund UI is implemented yet; manual refund via Boltz webapp is needed.`
+              )
+            }
+          },
+          log
+        )
+      }
     },
 
     async killEngine(): Promise<void> {
+      stopSwapMonitor()
       await engineProcessor.stop()
       fees.stop()
       pluginState.removeEngine(engineProcessor)
