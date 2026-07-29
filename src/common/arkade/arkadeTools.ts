@@ -82,7 +82,10 @@ const isBtcOnchainAddress = (value: string): boolean => {
   return segwit.test(value) || legacy.test(value)
 }
 
-export { isBtcOnchainAddress }
+const isEvmAddress = (value: string): boolean =>
+  /^0x[0-9a-fA-F]{40}$/.test(value.trim())
+
+export { isBtcOnchainAddress, isEvmAddress }
 
 const btcAmountToSats = (amountParam: string): string => {
   const amount = Number(amountParam)
@@ -274,7 +277,7 @@ export function makeArkadeTools(io: EdgeIo): EdgeCurrencyTools {
       }
 
       if (!isValidArkAddress(address)) {
-        // Bare onchain BTC → collaborative exit path.
+        // Bare onchain BTC → collaborative exit / Boltz path.
         if (isBtcOnchainAddress(address)) {
           const parsed: EdgeParsedUri = {
             publicAddress: address,
@@ -285,6 +288,13 @@ export function makeArkadeTools(io: EdgeIo): EdgeCurrencyTools {
             parsed.nativeAmount = amountSats
           }
           return parsed
+        }
+        // Parmesan: Rootstock (0x) → Boltz composition path.
+        if (isEvmAddress(address)) {
+          return {
+            publicAddress: address,
+            currencyCode: arkadeCurrencyInfo.currencyCode
+          }
         }
         throw new Error('InvalidUriError')
       }

@@ -43,7 +43,8 @@ import { deriveLnurlSessionToken } from './arkadeLnurl'
 import { ArkadeDiskletContractRepository } from './ArkadeDiskletContractRepository'
 import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
-import { asArkadePrivateKeys, isBolt11Invoice, isBtcOnchainAddress } from './arkadeTools'
+import { asArkadePrivateKeys, isBolt11Invoice, isBtcOnchainAddress, isEvmAddress } from './arkadeTools'
+import { quoteChainSwapFee } from '../boltz/boltzChainSwap'
 
 type ArkadeDelayType = 'blocks' | 'seconds'
 
@@ -977,6 +978,84 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       )
     }
 
+    // --- Parmesan: Rootstock (0x) via ARK→BTC + BTC→RBTC fee composition ---
+    if (isEvmAddress(to)) {
+      if (target.nativeAmount == null) {
+        const err = new Error('Unable to create zero-amount transaction.')
+        err.name = 'NoAmountSpecifiedError'
+        throw err
+      }
+      const amount = Math.abs(Number(target.nativeAmount))
+      if (!Number.isFinite(amount) || amount <= 0) {
+        const err = new Error('Unable to create zero-amount transaction.')
+        err.name = 'NoAmountSpecifiedError'
+        throw err
+      }
+      if (amount > Number(this.cachedBalance)) {
+        throw new Error('Insufficient funds')
+      }
+
+      // Fee = arkToBtc (ARK→BTC) + chain BTC→RBTC on the intermediate BTC amount.
+      const arkToBtc = await this.tryResolveArkToBtcPath(amount)
+      let arkFee = 0
+      if (arkToBtc != null) {
+        arkFee = arkToBtc.feeSats
+      } else {
+        try {
+          arkFee = Number(
+            this.estimateOnchainOutputFee(
+              'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4',
+              BigInt(amount),
+              undefined
+            )
+          )
+        } catch {
+          arkFee = 0
+        }
+      }
+      const btcAfterArk = Math.max(0, amount - arkFee)
+      const rbtcQuote = await quoteChainSwapFee(
+        'BTC',
+        'RBTC',
+        Math.max(btcAfterArk, 1),
+        this.fetch
+      )
+      const totalFee = arkFee + rbtcQuote.totalFeeSats
+      if (amount + totalFee > Number(this.cachedBalance)) {
+        // Some fee components are deducted from the locked amount rather than
+        // added on top; still require amount itself to be affordable.
+        if (amount > Number(this.cachedBalance)) {
+          throw new Error('Insufficient funds')
+        }
+      }
+
+      return this.attachSpendInfoMetadata(
+        {
+          blockHeight: 0,
+          currencyCode: arkadeCurrencyInfo.currencyCode,
+          date: Math.floor(Date.now() / 1000),
+          isSend: true,
+          memos: [],
+          nativeAmount: String(-amount),
+          networkFee: String(totalFee),
+          networkFees: [],
+          otherParams: {
+            paymentType: 'boltz_ark_rbtc',
+            to,
+            amount: String(amount),
+            arkFeeSats: arkFee,
+            rbtcFee: rbtcQuote
+          },
+          ourReceiveAddresses: [],
+          signedTx: '',
+          tokenId: null,
+          txid: '',
+          walletId: this.walletInfo.id
+        },
+        spendInfo
+      )
+    }
+
     // --- Onchain Bitcoin (Arkade Wallet: Boltz arkToBtc, settle fallback) ---
     if (isBtcOnchainAddress(to)) {
       if (target.nativeAmount == null) {
@@ -1129,6 +1208,53 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
 
     try {
+      if (paymentType === 'boltz_ark_rbtc') {
+        // Compose: create BTC→RBTC chain swap, then arkToBtc into Boltz BTC lockup.
+        const { createHash, randomBytes } = await import('crypto')
+        const preimage = randomBytes(32)
+        const preimageHash = createHash('sha256').update(preimage).digest('hex')
+        const { createBoltzChainSwap } = await import('../boltz/boltzChainSwap')
+        const created = await createBoltzChainSwap(
+          {
+            from: 'BTC',
+            to: 'RBTC',
+            userLockAmount: amount,
+            preimageHash,
+            claimAddress: to
+          },
+          this.fetch
+        )
+        const lockupDetails = created.lockupDetails as
+          | { lockupAddress?: string }
+          | undefined
+        const lockupAddress =
+          lockupDetails?.lockupAddress ??
+          (created.lockupAddress as string | undefined)
+        if (lockupAddress == null || lockupAddress === '') {
+          throw new Error('Boltz did not return a BTC lockup address')
+        }
+        const result = await this.payOnchainViaBoltz(lockupAddress, amount)
+        const out: EdgeTransaction = {
+          ...tx,
+          txid: result.txid,
+          metadata: {
+            ...tx.metadata,
+            notes: `Boltz ARK→RBTC ${String(created.id)} / ${result.boltzSwapId}`
+          },
+          otherParams: {
+            ...(tx.otherParams as object),
+            paymentType: 'boltz_ark_rbtc',
+            boltzSwapId: created.id,
+            arkBoltzSwapId: result.boltzSwapId,
+            boltzPreimage: preimage.toString('hex'),
+            to,
+            amount: String(amount)
+          }
+        }
+        await this.poll()
+        return out
+      }
+
       if (paymentType === 'onchain_boltz') {
         const result = await this.payOnchainViaBoltz(to, amount)
         const priorNotes =
