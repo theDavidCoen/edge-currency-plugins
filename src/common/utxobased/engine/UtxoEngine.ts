@@ -414,6 +414,12 @@ export async function makeUtxoEngine(
                   `Use refundPublicKey at m/${String(privateKeyFormat)}/0/0 to claim back ${String(swap.amount ?? '')} sats. ` +
                   `No refund UI is implemented yet; manual refund via Boltz webapp is needed.`
               )
+            },
+            onSwapReadyToClaimRbtc(swap: ParmesanSwapRecord) {
+              log.warn(
+                `[Parmesan] BTC→RBTC swap ${swap.id} server-locked — awaiting GUI EtherSwap.claim ` +
+                  `(claimAddress=${String(swap.claimAddress ?? '')}, serverLock=${String(swap.serverLockTxid ?? '')})`
+              )
             }
           },
           log
@@ -462,6 +468,7 @@ export async function makeUtxoEngine(
             claimAddress: transaction.otherParams.to,
             amount: transaction.otherParams.amount,
             created: transaction.otherParams.boltzCreated,
+            // claimAmountWei / refundAddress / timelock filled when Boltz locks RBTC
             status: 'locked_awaiting_claim'
           })
         )

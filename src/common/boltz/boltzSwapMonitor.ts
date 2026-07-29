@@ -3,18 +3,25 @@
  *
  * Temporary solution: polls Boltz every POLL_INTERVAL_MS while the engine is
  * running, updates the disklet record, and calls the provided callbacks so the
- * GUI can surface a toast / banner. A proper per-swap UI (refund flow, history
- * screen) is not yet implemented.
+ * GUI can surface a toast / banner / perform the RBTC claim.
+ *
+ * For BTC→RBTC, after Boltz locks RBTC (`transaction.server.confirmed`) the
+ * client MUST call EtherSwap.claim with the stored preimage. That claim is
+ * orchestrated by the GUI (needs the RSK wallet); this monitor only flips
+ * disklet status to `rbtc_claim_ready`.
  */
 
 import { Disklet } from 'disklet'
 
-import { getBoltzSwapStatus } from './boltzChainSwap'
+import {
+  BOLTZ_SERVER_LOCK_READY_STATES,
+  getBoltzSwapStatus
+} from './boltzChainSwap'
 
 const POLL_INTERVAL_MS = 60_000 // 1 minute
 const BOLTZ_FILE_PREFIX = 'parmesan-boltz-'
 
-/** States Boltz uses in GET /v2/swap/{id} */
+/** States Boltz uses in GET /v2/swap/{id} after a successful claim path. */
 const CLAIMED_STATES = new Set([
   'transaction.claimed',
   'invoice.settled',
@@ -35,6 +42,14 @@ export interface ParmesanSwapRecord {
   claimAddress?: string
   claimPriv?: string
   claimPub?: string
+  /** RBTC claim amount in wei (from Boltz server lock). */
+  claimAmountWei?: string
+  /** Boltz refundAddress on the EtherSwap lock. */
+  refundAddress?: string
+  /** EtherSwap timelock (block height). */
+  timelock?: number
+  /** RSK lock txid once Boltz broadcasts server lock. */
+  serverLockTxid?: string
   to?: string
   amount?: string | number
   created?: unknown
@@ -46,6 +61,8 @@ export interface SwapMonitorCallbacks {
   onSwapCompleted: (swap: ParmesanSwapRecord) => void
   /** Called when the swap timed out and a refund is needed. */
   onSwapRefundNeeded: (swap: ParmesanSwapRecord) => void
+  /** BTC→RBTC: Boltz locked RBTC; GUI must EtherSwap.claim with preimage. */
+  onSwapReadyToClaimRbtc?: (swap: ParmesanSwapRecord) => void
 }
 
 async function listPendingSwaps(
@@ -60,7 +77,8 @@ async function listPendingSwaps(
       const rec = JSON.parse(raw) as ParmesanSwapRecord
       if (
         rec.status === 'locked_awaiting_claim' ||
-        rec.status === 'locked_awaiting_btc_claim'
+        rec.status === 'locked_awaiting_btc_claim' ||
+        rec.status === 'rbtc_claim_ready'
       ) {
         pending.push(rec)
       }
@@ -74,12 +92,12 @@ async function listPendingSwaps(
 async function updateSwapRecord(
   disklet: Disklet,
   rec: ParmesanSwapRecord,
-  status: string
-): Promise<void> {
+  patch: Partial<ParmesanSwapRecord>
+): Promise<ParmesanSwapRecord> {
+  const next = { ...rec, ...patch }
   const filename = `${BOLTZ_FILE_PREFIX}${rec.id}.json`
-  await disklet
-    .setText(filename, JSON.stringify({ ...rec, status }))
-    .catch(() => undefined)
+  await disklet.setText(filename, JSON.stringify(next)).catch(() => undefined)
+  return next
 }
 
 async function pollOnce(
@@ -93,15 +111,29 @@ async function pollOnce(
     try {
       const statusData = await getBoltzSwapStatus(swap.id, fetchFn)
       const state = String(statusData.status ?? '')
+      const serverTx = statusData.transaction as { id?: string } | undefined
 
       if (CLAIMED_STATES.has(state)) {
         log.warn(`Boltz swap ${swap.id} completed (state: ${state})`)
-        await updateSwapRecord(disklet, swap, 'completed')
+        await updateSwapRecord(disklet, swap, { status: 'completed' })
         callbacks.onSwapCompleted(swap)
       } else if (FAILED_STATES.has(state)) {
         log.warn(`Boltz swap ${swap.id} expired/failed (state: ${state})`)
-        await updateSwapRecord(disklet, swap, 'refund_needed')
+        await updateSwapRecord(disklet, swap, { status: 'refund_needed' })
         callbacks.onSwapRefundNeeded(swap)
+      } else if (
+        swap.direction === 'btc_rbtc' &&
+        BOLTZ_SERVER_LOCK_READY_STATES.has(state)
+      ) {
+        const updated = await updateSwapRecord(disklet, swap, {
+          status: 'rbtc_claim_ready',
+          serverLockTxid: serverTx?.id ?? swap.serverLockTxid
+        })
+        log.warn(
+          `[Parmesan] BTC→RBTC swap ${swap.id} ready for RBTC claim ` +
+            `(Boltz ${state}). GUI must call EtherSwap.claim with preimage.`
+        )
+        callbacks.onSwapReadyToClaimRbtc?.(updated)
       }
       // else still in-flight — leave as-is
     } catch (e) {
