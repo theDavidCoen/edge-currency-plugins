@@ -976,12 +976,13 @@ export async function makeUtxoEngine(
           }
         })
         const signed = await this.signTx(lockSpend, privateKeys)
+        const swapId = String(created.id ?? '')
         signed.otherParams = {
           ...signed.otherParams,
           paymentType: 'boltz_btc_rbtc',
           to,
           amount: String(amount),
-          boltzSwapId: created.id,
+          boltzSwapId: swapId,
           boltzPreimage: preimage.toString('hex'),
           boltzPreimageHash: preimageHash,
           boltzRefundPub: walletRefundPubKey,
@@ -989,6 +990,12 @@ export async function makeUtxoEngine(
           lockupAddress,
           // Keep fee display from the quote tx:
           boltzFee: transaction.otherParams.boltzFee
+        }
+        // Ensure swap ID is always persisted in metadata notes so it is
+        // visible and copyable in Transaction Details.
+        signed.metadata = {
+          ...(signed.metadata ?? {}),
+          notes: `Boltz BTC→RBTC swap ID: ${swapId}`
         }
         signed.networkFee = transaction.networkFee
         signed.nativeAmount = transaction.nativeAmount
