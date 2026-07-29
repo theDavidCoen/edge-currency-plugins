@@ -20,6 +20,11 @@ import {
 
 import { filterUndefined } from '../../../util/filterUndefined'
 import { unixTime } from '../../../util/unixTime'
+import {
+  createBoltzChainSwap,
+  isEvmAddress,
+  quoteChainSwapFee
+} from '../../boltz/boltzChainSwap'
 import { makeFees } from '../../fees/makeFees'
 import { EngineEmitter, EngineEvent } from '../../plugin/EngineEmitter'
 import { makeMetadata } from '../../plugin/Metadata'
@@ -409,6 +414,28 @@ export async function makeUtxoEngine(
     },
 
     async broadcastTx(transaction: EdgeTransaction): Promise<EdgeTransaction> {
+      // Parmesan Boltz BTC→RBTC: after signTx rewrote the tx as a lock payment,
+      // persist pending claim state then broadcast normally.
+      if (
+        currencyInfo.pluginId === 'bitcoin' &&
+        transaction.otherParams?.paymentType === 'boltz_btc_rbtc' &&
+        transaction.otherParams?.boltzSwapId != null
+      ) {
+        await walletLocalDisklet.setText(
+          `parmesan-boltz-${String(transaction.otherParams.boltzSwapId)}.json`,
+          JSON.stringify({
+            id: transaction.otherParams.boltzSwapId,
+            direction: 'btc_rbtc',
+            preimage: transaction.otherParams.boltzPreimage,
+            preimageHash: transaction.otherParams.boltzPreimageHash,
+            claimAddress: transaction.otherParams.to,
+            amount: transaction.otherParams.amount,
+            created: transaction.otherParams.boltzCreated,
+            status: 'locked_awaiting_claim'
+          })
+        )
+      }
+
       const { otherParams } = transaction
       if (
         otherParams?.paymentProtocolInfo?.payment != null &&
@@ -530,6 +557,47 @@ export async function makeUtxoEngine(
     },
 
     async makeSpend(edgeSpendInfo: EdgeSpendInfo): Promise<EdgeTransaction> {
+      // Parmesan: BTC → Rootstock via Boltz chain swap (fee quote for Send UI).
+      if (currencyInfo.pluginId === 'bitcoin') {
+        const target = edgeSpendInfo.spendTargets[0]
+        const to = target?.publicAddress?.trim() ?? ''
+        if (isEvmAddress(to)) {
+          if (target.nativeAmount == null || target.nativeAmount === '') {
+            throw new Error('Unable to create zero-amount transaction.')
+          }
+          const amount = Math.abs(Number(target.nativeAmount))
+          if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error('Unable to create zero-amount transaction.')
+          }
+          const quote = await quoteChainSwapFee('BTC', 'RBTC', amount, io.fetch)
+          const fee = quote.totalFeeSats
+          if (amount + fee > Number(this.getBalance({ tokenId: null }))) {
+            throw new InsufficientFundsError({ tokenId: null })
+          }
+          return {
+            blockHeight: 0,
+            currencyCode: currencyInfo.currencyCode,
+            date: unixTime(),
+            isSend: true,
+            memos: [],
+            nativeAmount: String(-amount),
+            networkFee: String(fee),
+            networkFees: [],
+            otherParams: {
+              paymentType: 'boltz_btc_rbtc',
+              to,
+              amount: String(amount),
+              boltzFee: quote
+            },
+            ourReceiveAddresses: [],
+            signedTx: '',
+            tokenId: null,
+            txid: '',
+            walletId: walletInfo.id
+          }
+        }
+      }
+
       // Define which DatLayer is used for the spend:
       const makeSpendDataLayer = nonceDataLayer ?? dataLayer
       if (nonceDataLayer != null) nonceDataLayer = undefined
@@ -827,6 +895,75 @@ export async function makeUtxoEngine(
       transaction: EdgeTransaction,
       privateKeys: JsonObject
     ): Promise<EdgeTransaction> {
+      // Parmesan: rewrite synthetic Boltz quote tx into a signed lock payment.
+      if (
+        currencyInfo.pluginId === 'bitcoin' &&
+        transaction.otherParams?.paymentType === 'boltz_btc_rbtc'
+      ) {
+        const to = String(transaction.otherParams.to ?? '')
+        const amount = Number(transaction.otherParams.amount ?? 0)
+        if (!isEvmAddress(to) || !Number.isFinite(amount) || amount <= 0) {
+          throw new Error('Invalid Boltz BTC→RBTC spend')
+        }
+        const { createHash, randomBytes } = await import('crypto')
+        const preimage = randomBytes(32)
+        const preimageHash = createHash('sha256').update(preimage).digest('hex')
+        // Use a real derived public key from the sending wallet so the user can
+        // actually sign a refund transaction if Boltz fails to complete the swap.
+        const walletRefundPubKey = walletTools.getPubkey({
+          format: privateKeyFormat,
+          changeIndex: 0,
+          addressIndex: 0
+        })
+        const created = await createBoltzChainSwap(
+          {
+            from: 'BTC',
+            to: 'RBTC',
+            userLockAmount: amount,
+            preimageHash,
+            claimAddress: to,
+            refundPublicKey: walletRefundPubKey
+          },
+          io.fetch
+        )
+        const lockupDetails = created.lockupDetails as
+          | { lockupAddress?: string }
+          | undefined
+        const lockupAddress =
+          lockupDetails?.lockupAddress ??
+          (created.lockupAddress as string | undefined)
+        if (lockupAddress == null || lockupAddress === '') {
+          throw new Error('Boltz did not return a BTC lockup address')
+        }
+        const lockSpend = await this.makeSpend({
+          tokenId: null,
+          spendTargets: [
+            { publicAddress: lockupAddress, nativeAmount: String(amount) }
+          ],
+          metadata: {
+            notes: `Boltz BTC→RBTC ${String(created.id ?? '')}`
+          }
+        })
+        const signed = await this.signTx(lockSpend, privateKeys)
+        signed.otherParams = {
+          ...signed.otherParams,
+          paymentType: 'boltz_btc_rbtc',
+          to,
+          amount: String(amount),
+          boltzSwapId: created.id,
+          boltzPreimage: preimage.toString('hex'),
+          boltzPreimageHash: preimageHash,
+          boltzRefundPub: walletRefundPubKey,
+          boltzCreated: created,
+          lockupAddress,
+          // Keep fee display from the quote tx:
+          boltzFee: transaction.otherParams.boltzFee
+        }
+        signed.networkFee = transaction.networkFee
+        signed.nativeAmount = transaction.nativeAmount
+        return signed
+      }
+
       const otherParams = transaction.otherParams as UtxoTxOtherParams
       if (otherParams == null) throw new Error('Invalid transaction data')
 
