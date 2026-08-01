@@ -462,7 +462,19 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         if (!isBtcOnchainAddress(destination)) {
           throw new Error('Destination must be a Bitcoin onchain address')
         }
-        return await this.runUnilateralExitToAddress(destination)
+        try {
+          return await this.runUnilateralExitToAddress(destination)
+        } catch (error: unknown) {
+          throw new Error(this.formatOnchainExitError(error))
+        }
+      },
+
+      /**
+       * P2TR key-path address used to pay Unroll CPFP fees (not the boarding
+       * address — boarding UTXOs auto-settle into Ark).
+       */
+      arkadeGetUnrollFeeAddress: async (): Promise<string> => {
+        return await this.getUnrollFeeAddress()
       },
 
       /**
@@ -2046,6 +2058,23 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     return Number(estimator.vsize().value)
   }
 
+  private async getUnrollFeeAddress(): Promise<string> {
+    const wallet = await this.waitForWalletReady(8_000).catch(() => this.wallet)
+    if (wallet == null) {
+      throw new Error('Engine not started')
+    }
+    const onchainWallet = await OnchainWallet.create(
+      wallet.identity,
+      wallet.networkName,
+      wallet.onchainProvider
+    )
+    const address = String(onchainWallet.address ?? '')
+    if (address === '') {
+      throw new Error('Could not derive Unroll fee address')
+    }
+    return address
+  }
+
   private async runUnilateralExitToAddress(
     destinationAddress: string
   ): Promise<{
@@ -2192,6 +2221,14 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         : typeof error === 'string'
         ? error
         : 'Onchain exit failed'
+    if (/^Insufficient funds$/i.test(message.trim())) {
+      return (
+        'Unroll needs on-chain BTC at this wallet’s P2TR key-path address ' +
+        'to pay CPFP package fees. That address is not the Arkade boarding ' +
+        'address (boarding funds auto-settle into Ark). Fund the key-path ' +
+        'address shown in Unilateral Exit, then try again.'
+      )
+    }
     if (
       /minExpiryGap/i.test(message) ||
       (/INVALID_PSBT_INPUT/i.test(message) && /expir/i.test(message))
