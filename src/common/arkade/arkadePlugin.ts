@@ -11,6 +11,7 @@ import { ArkadeEngine } from './ArkadeEngine'
 import { arkadeCurrencyInfo, asArkadeSettings } from './arkadeInfo'
 import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
+import { ArkadeUnrollCache } from './ArkadeUnrollCache'
 import { makeArkadeTools } from './arkadeTools'
 
 export function makeArkadePlugin(
@@ -40,6 +41,7 @@ export function makeArkadePlugin(
         walletInfo.id
       )
       const sdkStorage = new ArkadeDiskletSdkStorage(walletDisklet, walletInfo.id)
+      const unrollCache = new ArkadeUnrollCache(walletDisklet, walletInfo.id)
       return new ArkadeEngine(
         walletInfo,
         engineOptions,
@@ -51,7 +53,8 @@ export function makeArkadePlugin(
         },
         settings,
         swapRepository,
-        sdkStorage
+        sdkStorage,
+        unrollCache
       )
     },
 

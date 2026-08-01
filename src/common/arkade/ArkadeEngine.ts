@@ -43,6 +43,11 @@ import { deriveLnurlSessionToken } from './arkadeLnurl'
 import { ArkadeDiskletContractRepository } from './ArkadeDiskletContractRepository'
 import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
+import {
+  ArkadeUnrollCache,
+  UNROLL_CACHE_MISS_MESSAGE,
+  wrapIndexerWithUnrollCache
+} from './ArkadeUnrollCache'
 import { asArkadePrivateKeys, isBolt11Invoice, isBtcOnchainAddress } from './arkadeTools'
 
 type ArkadeDelayType = 'blocks' | 'seconds'
@@ -170,6 +175,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private lnurlReconnectTimer: ReturnType<typeof setTimeout> | undefined
   /** Shared in-flight Wallet.create / restore so concurrent syncNetwork calls wait. */
   private walletInitPromise: Promise<void> | undefined
+  /** Last successful unroll artifact prefetch (ms). */
+  private unrollPrefetchAt = 0
+  private unrollPrefetchInflight: Promise<void> | undefined
 
   /**
    * Edge `io.fetch` wrapper passed from the plugin.
@@ -187,7 +195,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     io: { fetch: (uri: string, init?: any) => Promise<any> },
     settings: ArkadeSettings,
     private readonly swapRepository: ArkadeDiskletSwapRepository,
-    private readonly sdkStorage: ArkadeDiskletSdkStorage
+    private readonly sdkStorage: ArkadeDiskletSdkStorage,
+    private readonly unrollCache: ArkadeUnrollCache
   ) {
     this.walletInfo = walletInfo
     this.settings = settings
@@ -1807,6 +1816,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private static readonly UNROLL_CHILD_VSIZE_FALLBACK = 110
   /** Mempool fee-rate floor when explorer is unreachable (sat/vB). */
   private static readonly UNILATERAL_FEE_RATE_FALLBACK = 5
+  /** Minimum interval between unroll artifact prefetches. */
+  private static readonly UNROLL_PREFETCH_MIN_MS = 12 * 60 * 1000
 
   /**
    * Fee estimate for Unilateral Exit without Arklabs indexer/ASP.
@@ -2042,11 +2053,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     destination: string
     phase: 'sweep' | 'unroll'
   }> {
-    const wallet = await this.waitForWalletReady()
-    const vtxos = await wallet.getVtxos({
-      withRecoverable: true,
-      withUnrolled: false
-    })
+    const wallet = await this.waitForWalletReady(8_000).catch(() => this.wallet)
+    if (wallet == null) {
+      throw new Error('Engine not started')
+    }
+    const vtxos = await this.getVtxosForUnilateralEstimate(wallet)
     if (vtxos.length === 0) {
       throw new Error('No funds available to exit')
     }
@@ -2057,15 +2068,32 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       wallet.onchainProvider
     )
 
+    const indexer = wrapIndexerWithUnrollCache(
+      wallet.indexerProvider,
+      this.unrollCache
+    )
+
     for (const vtxo of vtxos) {
-      const session = await Unroll.Session.create(
-        { txid: vtxo.txid, vout: vtxo.vout },
-        onchainWallet,
-        wallet.onchainProvider,
-        wallet.indexerProvider
-      )
-      for await (const _step of session) {
-        // Session iterator executes WAIT / UNROLL steps.
+      try {
+        const session = await Unroll.Session.create(
+          { txid: vtxo.txid, vout: vtxo.vout },
+          onchainWallet,
+          wallet.onchainProvider,
+          indexer
+        )
+        for await (const _step of session) {
+          // Session iterator executes WAIT / UNROLL steps.
+        }
+      } catch (error: unknown) {
+        const message =
+          error instanceof Error ? error.message : String(error)
+        if (message.includes(UNROLL_CACHE_MISS_MESSAGE)) {
+          throw error
+        }
+        if (/not found|indexer|fetch|network|ECONN|timeout/i.test(message)) {
+          throw new Error(`${UNROLL_CACHE_MISS_MESSAGE} (${message})`)
+        }
+        throw error
       }
     }
 
@@ -2093,6 +2121,68 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       }
       throw error
     }
+  }
+
+  /** Best-effort: populate chain + virtual PSBT cache while indexer is reachable. */
+  private scheduleUnrollPrefetch(wallet: any): void {
+    if (wallet?.indexerProvider == null) return
+    if (this.unrollPrefetchInflight != null) return
+    if (
+      Date.now() - this.unrollPrefetchAt <
+      ArkadeEngine.UNROLL_PREFETCH_MIN_MS
+    ) {
+      return
+    }
+    this.unrollPrefetchInflight = this.prefetchUnrollArtifacts(wallet)
+      .catch((error: unknown) => {
+        console.warn('[arkade] unroll artifact prefetch failed', error)
+      })
+      .finally(() => {
+        this.unrollPrefetchInflight = undefined
+      })
+  }
+
+  private async prefetchUnrollArtifacts(wallet: any): Promise<void> {
+    let vtxos: any[] = []
+    try {
+      vtxos = await this.getVtxosForUnilateralEstimate(wallet)
+    } catch {
+      return
+    }
+    if (vtxos.length === 0) return
+
+    const indexer = wrapIndexerWithUnrollCache(
+      wallet.indexerProvider,
+      this.unrollCache
+    )
+
+    for (const vtxo of vtxos) {
+      try {
+        const { chain } = await indexer.getVtxoChain({
+          txid: vtxo.txid,
+          vout: vtxo.vout
+        })
+        if (!Array.isArray(chain)) continue
+        for (const chainTx of chain) {
+          if (
+            chainTx?.type === ChainTxType.COMMITMENT ||
+            chainTx?.type === ChainTxType.UNSPECIFIED
+          ) {
+            continue
+          }
+          const txid = chainTx?.txid
+          if (typeof txid !== 'string' || txid === '') continue
+          await indexer.getVirtualTxs([txid])
+        }
+      } catch (error: unknown) {
+        console.warn(
+          `[arkade] prefetch unroll artifacts for ${String(vtxo?.txid)} failed`,
+          error
+        )
+      }
+    }
+
+    this.unrollPrefetchAt = Date.now()
   }
 
   private formatOnchainExitError(error: unknown): string {
@@ -2654,6 +2744,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         this.onAddressChanged?.()
       } catch {}
     }
+
+    // Populate Unroll chain/PSBT cache while indexer is reachable (best-effort).
+    this.scheduleUnrollPrefetch(this.wallet)
   }
 
   /** Boltz swap ids look like `37XaHp17umws`, not 64-char hex txids. */
