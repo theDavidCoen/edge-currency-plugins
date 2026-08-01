@@ -1354,13 +1354,19 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private async tryResolveArkToBtcPath(
     receiverAmountSats: number
   ): Promise<{ feeSats: number } | null> {
-    if (
-      this.swaps == null ||
-      !Number.isFinite(receiverAmountSats) ||
-      receiverAmountSats <= 0
-    ) {
+    if (!Number.isFinite(receiverAmountSats) || receiverAmountSats <= 0) {
       return null
     }
+    // makeSpend can run before Boltz init finishes; wait briefly so we do not
+    // fall through to ASP settle (which fails on fresh VTXOs).
+    if (this.swaps == null) {
+      try {
+        await this.waitForSwapsReady(15_000)
+      } catch {
+        return null
+      }
+    }
+    if (this.swaps == null) return null
     try {
       const CACHE_MS = 30_000
       const now = Date.now()
@@ -1790,14 +1796,28 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
   }
 
+  /**
+   * Conservative parent vsize for a TREE / checkpoint unroll tx when the
+   * Arklabs indexer is unavailable (no virtual PSBT to measure).
+   */
+  private static readonly UNROLL_PARENT_VSIZE = 160
+  /** Assumed off-chain packages still needing broadcast per VTXO (TREE + checkpoint). */
+  private static readonly UNROLL_PACKAGES_PER_VTXO = 2
+  /** Fallback CPFP child vsize if boarding address / OnchainWallet is unavailable. */
+  private static readonly UNROLL_CHILD_VSIZE_FALLBACK = 110
+  /** Mempool fee-rate floor when explorer is unreachable (sat/vB). */
+  private static readonly UNILATERAL_FEE_RATE_FALLBACK = 5
+
+  /**
+   * Fee estimate for Unilateral Exit without Arklabs indexer/ASP.
+   * Uses local VTXO tapTrees + a conservative unroll package heuristic and
+   * Bitcoin mempool fee rates (or a local default).
+   */
   private async estimateUnilateralExitFees(
     destinationAddress: string
   ): Promise<ArkadeUnilateralExitEstimate> {
-    const wallet = await this.waitForWalletReady()
-    const vtxos = await wallet.getVtxos({
-      withRecoverable: true,
-      withUnrolled: false
-    })
+    const wallet = await this.waitForWalletReady(8_000).catch(() => this.wallet)
+    const vtxos = await this.getVtxosForUnilateralEstimate(wallet)
     if (vtxos.length === 0) {
       throw new Error('No funds available to exit')
     }
@@ -1807,47 +1827,65 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       grossAmountSats += BigInt(vtxo.value)
     }
 
-    const onchainWallet = await OnchainWallet.create(
-      wallet.identity,
-      wallet.networkName,
-      wallet.onchainProvider
-    )
+    const network = wallet?.network ?? networks.bitcoin
 
-    let feeRate =
-      (await wallet.onchainProvider.getFeeRate()) ?? OnchainWallet.MIN_FEE_RATE
-    if (feeRate < OnchainWallet.MIN_FEE_RATE) {
-      feeRate = OnchainWallet.MIN_FEE_RATE
-    }
-
-    let timelockBlocks = 144
+    let feeRate = ArkadeEngine.UNILATERAL_FEE_RATE_FALLBACK
     try {
-      const info = await wallet.arkProvider.getInfo()
-      if (info.unilateralExitDelay < BigInt(512)) {
-        timelockBlocks = Number(info.unilateralExitDelay)
+      const provider = wallet?.onchainProvider
+      if (provider?.getFeeRate != null) {
+        const live = await provider.getFeeRate()
+        if (live != null && Number.isFinite(live) && live > 0) {
+          feeRate = live
+        }
       }
     } catch {
-      // Keep default timelock hint.
+      // Bitcoin explorer unreachable — keep local fallback.
+    }
+    const minRate = OnchainWallet.MIN_FEE_RATE ?? 1
+    if (feeRate < minRate) feeRate = minRate
+
+    const timelockBlocks = this.estimateTimelockBlocksFromVtxos(vtxos)
+
+    let boardingAddress: string | undefined
+    try {
+      if (wallet != null) {
+        const onchainWallet = await OnchainWallet.create(
+          wallet.identity,
+          wallet.networkName,
+          wallet.onchainProvider
+        )
+        boardingAddress = onchainWallet.address
+      }
+    } catch {
+      // Estimate CPFP child with fixed vsize fallback.
     }
 
     let totalVBytes = 0
     let estimatedFeeSats = BigInt(0)
 
     for (const vtxo of vtxos) {
-      const bump = await this.estimateUnrollBumpFees(
-        wallet,
-        onchainWallet,
+      const bump = this.estimateUnrollBumpFeesLocal(
         vtxo,
-        feeRate
+        feeRate,
+        network,
+        boardingAddress
       )
       totalVBytes += bump.vBytes
       estimatedFeeSats += bump.feeSats
     }
 
-    const sweepVBytes = this.estimateSweepVBytes(
-      vtxos,
-      destinationAddress,
-      wallet.network
-    )
+    let sweepVBytes = 50 + vtxos.length * 200
+    try {
+      if (network != null) {
+        sweepVBytes = this.estimateSweepVBytes(
+          vtxos,
+          destinationAddress,
+          network
+        )
+      }
+    } catch (error: unknown) {
+      console.warn('[arkade] local sweep vsize estimate failed', error)
+    }
     totalVBytes += sweepVBytes
     const sweepFee = BigInt(Math.ceil(feeRate * sweepVBytes))
     estimatedFeeSats += sweepFee
@@ -1874,73 +1912,99 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
   }
 
-  private async estimateUnrollBumpFees(
-    wallet: any,
-    onchainWallet: OnchainWallet,
-    vtxo: any,
-    feeRate: number
-  ): Promise<{ feeSats: bigint; vBytes: number }> {
-    const { chain } = await wallet.indexerProvider.getVtxoChain({
-      txid: vtxo.txid,
-      vout: vtxo.vout
-    })
+  private async getVtxosForUnilateralEstimate(wallet: any): Promise<any[]> {
+    const filterSpent = (list: any[]): any[] =>
+      list.filter(vtxo => {
+        if (vtxo?.isSpent === true) return false
+        const state = String(vtxo?.virtualStatus?.state ?? '')
+        if (state === 'swept') return false
+        if (vtxo?.isUnrolled === true) return false
+        return true
+      })
 
-    let feeSats = BigInt(0)
-    let vBytes = 0
-
-    for (let i = chain.length - 1; i >= 0; i--) {
-      const chainTx = chain[i]
-      if (
-        chainTx.type === ChainTxType.COMMITMENT ||
-        chainTx.type === ChainTxType.UNSPECIFIED
-      ) {
-        continue
-      }
-
+    if (wallet != null) {
       try {
-        const txInfo = await wallet.onchainProvider.getTxStatus(chainTx.txid)
-        if (!txInfo.confirmed) {
-          // Exit already in progress — fee already committed in mempool.
-          continue
-        }
-        continue
-      } catch {
-        // Offchain: needs Unroll + CPFP bump.
-      }
-
-      const virtualTxs = await wallet.indexerProvider.getVirtualTxs([
-        chainTx.txid
-      ])
-      if (virtualTxs.txs.length === 0) {
-        throw new Error(`Virtual tx ${chainTx.txid} not found`)
-      }
-
-      const tx = Transaction.fromPSBT(base64.decode(virtualTxs.txs[0]))
-      if (chainTx.type === ChainTxType.TREE) {
-        const input = tx.getInput(0)
-        if (input?.tapKeySig == null) {
-          throw new Error(`Tap key sig not found for tree tx ${chainTx.txid}`)
-        }
-        tx.updateInput(0, {
-          finalScriptWitness: [input.tapKeySig]
+        const live = await wallet.getVtxos({
+          withRecoverable: true,
+          withUnrolled: false
         })
-      } else {
-        tx.finalize()
+        if (Array.isArray(live) && live.length > 0) {
+          return filterSpent(live)
+        }
+      } catch (error: unknown) {
+        console.warn(
+          '[arkade] getVtxos for unilateral estimate failed; using cache',
+          error
+        )
       }
-
-      const parentVsize = tx.vsize
-      const childVsize = Number(
-        TxWeightEstimator.create()
-          .addKeySpendInput(true)
-          .addP2AInput()
-          .addOutputAddress(onchainWallet.address, wallet.network)
-          .vsize().value
-      )
-      const packageVsize = parentVsize + childVsize
-      vBytes += packageVsize
-      feeSats += BigInt(Math.ceil(feeRate * packageVsize))
+      const cached = filterSpent(await this.getCachedSdkVtxos(wallet))
+      if (cached.length > 0) return cached
     }
 
+    throw new Error(
+      'No local VTXOs available for exit estimate. Wait for the wallet to finish loading, then try again.'
+    )
+  }
+
+  private estimateTimelockBlocksFromVtxos(vtxos: any[]): number {
+    let timelockBlocks = 144
+    for (const vtxo of vtxos) {
+      try {
+        if (vtxo?.tapTree == null) continue
+        const decoded = VtxoScript.decode(vtxo.tapTree)
+        const exits = decoded.exitPaths()
+        const exit =
+          exits.find(
+            (path: { params: { timelock: { type: string; value?: bigint } } }) =>
+              path.params.timelock.type === 'blocks'
+          ) ?? exits[0]
+        const value = exit?.params?.timelock?.value
+        if (value != null && value > BigInt(0) && value < BigInt(512)) {
+          timelockBlocks = Number(value)
+          break
+        }
+      } catch {
+        // Try next VTXO.
+      }
+    }
+    return timelockBlocks
+  }
+
+  /**
+   * Local unroll package fee estimate — no indexer / ASP.
+   * Conservative: assume TREE + checkpoint packages still need CPFP broadcast.
+   */
+  private estimateUnrollBumpFeesLocal(
+    vtxo: any,
+    feeRate: number,
+    network: typeof networks.bitcoin,
+    boardingAddress: string | undefined
+  ): { feeSats: bigint; vBytes: number } {
+    const state = String(vtxo?.virtualStatus?.state ?? '')
+    if (vtxo?.isUnrolled === true || state === 'swept') {
+      return { feeSats: BigInt(0), vBytes: 0 }
+    }
+
+    let childVsize = ArkadeEngine.UNROLL_CHILD_VSIZE_FALLBACK
+    if (boardingAddress != null && network != null) {
+      try {
+        childVsize = Number(
+          TxWeightEstimator.create()
+            .addKeySpendInput(true)
+            .addP2AInput()
+            .addOutputAddress(boardingAddress, network)
+            .vsize().value
+        )
+      } catch {
+        // Keep fallback child size.
+      }
+    }
+
+    const packageVsize =
+      ArkadeEngine.UNROLL_PARENT_VSIZE + childVsize
+    const packages = ArkadeEngine.UNROLL_PACKAGES_PER_VTXO
+    const vBytes = packageVsize * packages
+    const feeSats = BigInt(Math.ceil(feeRate * vBytes))
     return { feeSats, vBytes }
   }
 
