@@ -6,7 +6,6 @@ import {
   OnchainWallet,
   RestDelegatorProvider,
   Transaction,
-  TxWeightEstimator,
   Unroll,
   VHTLC,
   VtxoScript,
@@ -14,6 +13,7 @@ import {
   Wallet,
   networks
 } from '@arkade-os/sdk'
+import { TxWeightEstimator } from '@arkade-tx-size-estimator'
 import { base64, hex } from '@scure/base'
 import { Address, OutScript, TaprootControlBlock } from '@scure/btc-signer'
 import {
@@ -848,23 +848,16 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       feeInfo = info?.fees
     } catch {}
 
-    const isSwapQuote = spendInfo.savedAction?.actionType === 'swap'
-    if (isSwapQuote) {
-      const amount =
-        rawAmount != null && rawAmount !== ''
-          ? BigInt(Math.abs(Number(rawAmount)))
-          : balance
-      const outputFee = this.estimateOnchainOutputFee(to, amount, feeInfo)
-      const max = balance - outputFee
-      return max > BigInt(0) ? max.toString() : '0'
-    }
-
-    const { sendAmount } = await this.prepareOnchainExit(
-      to,
-      undefined,
-      feeInfo
-    )
-    return sendAmount.toString()
+    // Collaborative settle fallback: fee estimate only. Do not call
+    // prepareOnchainExit here — SettlementMinExpiryGap / ASP hangs freeze the
+    // send UI while typing amounts. Eligibility is enforced in broadcastTx.
+    const amount =
+      rawAmount != null && rawAmount !== ''
+        ? BigInt(Math.abs(Number(rawAmount)))
+        : balance
+    const outputFee = this.estimateOnchainOutputFee(to, amount, feeInfo)
+    const max = balance - outputFee
+    return max > BigInt(0) ? max.toString() : '0'
   }
 
   private attachSpendInfoMetadata(
@@ -1039,21 +1032,18 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         feeInfo = info?.fees
       } catch {}
 
-      let outputFee: bigint
-      if (isSwapQuote) {
-        // Quote discovery: many providers call makeSpend in parallel. Do not
-        // hit getVtxos / prepareOnchainExit here — that stalls the whole swap UI.
-        outputFee = this.estimateOnchainOutputFee(to, BigInt(amount), feeInfo)
-        console.warn(
-          `[arkade swap quote] makeSpend settle fee estimate amount=${amount} fee=${outputFee.toString()} to=${to}`
-        )
-      } else {
-        ;({ outputFee } = await this.prepareOnchainExit(
-          to,
-          BigInt(amount),
-          feeInfo
-        ))
-      }
+      // Collaborative settle fallback only when Boltz is unavailable / out of
+      // limits. Fee estimate only — prepareOnchainExit here surfaces
+      // SettlementMinExpiryGap ("VTXO too fresh") and can hang the send UI
+      // before slide-to-confirm. Real eligibility runs in broadcastTx.
+      const outputFee = this.estimateOnchainOutputFee(
+        to,
+        BigInt(amount),
+        feeInfo
+      )
+      console.warn(
+        `[arkade onchain] makeSpend via ASP settle fallback amount=${amount} fee=${outputFee.toString()} to=${to} quote=${isSwapQuote}`
+      )
 
       return this.attachSpendInfoMetadata(
         {
@@ -1409,11 +1399,16 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
   /**
    * Arkade Wallet `payBtc`: create chain swap → fund ARK lockup offchain →
-   * wait for Boltz to lock BTC and claim to destination.
+   * claim BTC on L1 via Boltz.
    *
    * Edge txid MUST be the Ark fund tx (matches SDK history). Boltz's
    * waitForSwapCompletion returns the swap id for chain swaps — never use that
    * as Edge txid (it creates a duplicate phantom row that vanishes on resync).
+   *
+   * Claim completion can take minutes. Do not block Edge `broadcastTx` /
+   * slide-to-confirm on `waitAndClaimBtc` — that freezes the send slider.
+   * After a successful fund, return immediately and finish the claim in
+   * background (swap state is persisted in the Disklet swap repo).
    */
   private async payOnchainViaBoltz(
     btcAddress: string,
@@ -1438,34 +1433,64 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       throw new Error('Boltz arkToBtc missing swap id')
     }
 
-    const fundTxid = String(
-      await wallet.send({
-        address: result.arkAddress,
-        amount: result.amountToPay
-      })
-    )
+    // Timed offchain send — raw wallet.send can hang forever on ASP finalize.
+    const fundTxid = await this.sendOffchainWithRecovery(wallet, {
+      address: result.arkAddress,
+      amount: result.amountToPay
+    })
     if (fundTxid === '') {
       throw new Error('Failed to fund Boltz ARK lockup')
     }
 
-    let claimTxid = ''
-    try {
-      // Blocks until claimed. Return value is the Boltz swap id for chain swaps
-      // — ignore it as a blockchain txid.
-      await swaps.waitAndClaimBtc(result.pendingSwap)
+    const pendingSwap = result.pendingSwap
+    const claimPromise = (async (): Promise<string> => {
+      // Return value is the Boltz swap id for chain swaps — ignore as txid.
+      await swaps.waitAndClaimBtc(pendingSwap)
       try {
         const status = await swaps.getSwapStatus(boltzSwapId)
-        claimTxid = String(status?.transaction?.id ?? '')
-      } catch {}
+        return String(status?.transaction?.id ?? '')
+      } catch {
+        return ''
+      }
+    })()
+
+    // Brief window so fast claims still attach claimTxid; then release the UI.
+    const CLAIM_UI_BUDGET_MS = 20_000
+    let claimTxid = ''
+    try {
+      const raced = await Promise.race([
+        claimPromise.then(id => ({ done: true as const, id })),
+        new Promise<{ done: false }>(resolve =>
+          setTimeout(() => resolve({ done: false }), CLAIM_UI_BUDGET_MS)
+        )
+      ])
+      if (raced.done) {
+        claimTxid = raced.id
+      } else {
+        console.warn(
+          `[arkade] Boltz claim still pending after ${CLAIM_UI_BUDGET_MS}ms; continuing in background swapId=${boltzSwapId}`
+        )
+      }
     } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : typeof error === 'string'
-          ? error
-          : 'Boltz ARK→BTC claim failed'
-      throw new Error(message)
+      // Fund already succeeded — do not fail broadcastTx / stick the slider.
+      console.warn(
+        '[arkade] Boltz waitAndClaimBtc error after fund; claim may still complete',
+        error
+      )
     }
+
+    void claimPromise
+      .then(async id => {
+        if (id !== '') {
+          console.warn(`[arkade] Boltz claim completed claimTxid=${id}`)
+        }
+        try {
+          await this.poll()
+        } catch {}
+      })
+      .catch((error: unknown) => {
+        console.warn('[arkade] Boltz background claim failed', error)
+      })
 
     return { txid: fundTxid, boltzSwapId, claimTxid }
   }
