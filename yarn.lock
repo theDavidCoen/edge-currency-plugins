@@ -15,10 +15,25 @@
     bip68 "1.0.4"
     light-bolt11-decoder "3.2.0"
 
-"@arkade-os/sdk@0.4.52", "@arkade-os/sdk@^0.4.52":
+"@arkade-os/sdk@0.4.52":
   version "0.4.52"
   resolved "https://registry.yarnpkg.com/@arkade-os/sdk/-/sdk-0.4.52.tgz#fcfe52b393531cff653804b1ed4a9cbc08ac7c49"
   integrity sha512-ZyyaUOg0obpDnDHphIMXjZBeRQHWBHaNtA5eKSv2EypVQIOyTkMlorhKwojJvUvHD28aO8cG1lCjaiJl4R/jkw==
+  dependencies:
+    "@bitcoinerlab/descriptors-scure" "3.1.7"
+    "@marcbachmann/cel-js" "8.0.0"
+    "@noble/curves" "2.0.1"
+    "@noble/secp256k1" "3.0.0"
+    "@scure/base" "2.0.0"
+    "@scure/bip39" "2.0.1"
+    "@scure/btc-signer" "2.0.1"
+    bip68 "1.0.4"
+    ws-electrumx-client "1.0.5"
+
+"@arkade-os/sdk@^0.4.54":
+  version "0.4.54"
+  resolved "https://registry.yarnpkg.com/@arkade-os/sdk/-/sdk-0.4.54.tgz#97f1b300775625ab317d0aceac191141687a6e3a"
+  integrity sha512-jwGbn+mb42drjA/d2idNaeLQYQMG/H1dgWryzlG2FAQfnFr9BJbAt24Lo+rwS8D1Wnkln7k/fRlz53K4LSkBwg==
   dependencies:
     "@bitcoinerlab/descriptors-scure" "3.1.7"
     "@marcbachmann/cel-js" "8.0.0"

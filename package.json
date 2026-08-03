@@ -41,7 +41,7 @@
   },
   "dependencies": {
     "@arkade-os/boltz-swap": "^0.3.57",
-    "@arkade-os/sdk": "^0.4.52",
+    "@arkade-os/sdk": "^0.4.54",
     "@bitcoinerlab/secp256k1": "^1.2.0",
     "altcoin-js": "^1.0.0",
     "async-mutex": "^0.2.6",

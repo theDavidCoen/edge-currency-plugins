@@ -6,12 +6,14 @@ import {
   OnchainWallet,
   RestDelegatorProvider,
   Transaction,
+  UnilateralExit,
   Unroll,
   VHTLC,
   VtxoScript,
   WalletRepositoryImpl,
   Wallet,
-  networks
+  networks,
+  serializeExitPackage
 } from '@arkade-os/sdk'
 import { TxWeightEstimator } from '@arkade-tx-size-estimator'
 import { base64, hex } from '@scure/base'
@@ -116,6 +118,22 @@ export interface ArkadeUnilateralExitEstimate {
   uneconomical: boolean
   highFeeImpact: boolean
 }
+
+/**
+ * Keyless graph-mode exit package for the Edge web executor prototype.
+ * Fee funding happens on the website — prefer a future in-app executor.
+ */
+export interface ArkadeUnilateralExitPackageResult {
+  json: string
+  filename: string
+  executorUrl: string
+  mode: 'graph'
+  sweepAddress: string
+}
+
+/** Edge-branded unilateral-exit Pages fork (prototype). */
+export const ARKADE_UNILATERAL_EXIT_EXECUTOR_URL =
+  'https://thedavidcoen.github.io/arkade-unilateral-exit/'
 
 /** Result of preflight checks before Arkade → other-asset swap quotes. */
 export interface ArkadeOnchainSwapEligibility {
@@ -447,6 +465,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
       /**
        * Broadcast the unilateral exit chain (Unroll steps, then sweep when possible).
+       * Prefer `arkadePrepareUnilateralExitPackage` + web executor for average users.
        */
       arkadeUnilateralExitToAddress: async (
         destination: string
@@ -464,6 +483,27 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         }
         try {
           return await this.runUnilateralExitToAddress(destination)
+        } catch (error: unknown) {
+          throw new Error(this.formatOnchainExitError(error))
+        }
+      },
+
+      /**
+       * Build a graph-mode unilateral exit JSON package (no in-app Unroll/CPFP).
+       * User imports the file into the Edge web executor to fund fees and finish.
+       */
+      arkadePrepareUnilateralExitPackage: async (
+        destination: string
+      ): Promise<ArkadeUnilateralExitPackageResult> => {
+        if (this.wallet == null) throw new Error('Engine not started')
+        if (destination == null || destination === '') {
+          throw new Error('Missing destination address')
+        }
+        if (!isBtcOnchainAddress(destination)) {
+          throw new Error('Destination must be a Bitcoin onchain address')
+        }
+        try {
+          return await this.prepareUnilateralExitPackage(destination)
         } catch (error: unknown) {
           throw new Error(this.formatOnchainExitError(error))
         }
@@ -2073,6 +2113,58 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       throw new Error('Could not derive Unroll fee address')
     }
     return address
+  }
+
+  private async prepareUnilateralExitPackage(
+    destinationAddress: string
+  ): Promise<ArkadeUnilateralExitPackageResult> {
+    const wallet = await this.waitForWalletReady(8_000).catch(() => this.wallet)
+    if (wallet == null) {
+      throw new Error('Engine not started')
+    }
+
+    const onchainWallet = await OnchainWallet.create(
+      wallet.identity,
+      wallet.networkName,
+      wallet.onchainProvider
+    )
+
+    let pkg
+    try {
+      pkg = await UnilateralExit.prepare({
+        wallet,
+        onchainWallet,
+        sweepAddress: destinationAddress,
+        mode: 'graph',
+        networkName: wallet.networkName
+      })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes(UNROLL_CACHE_MISS_MESSAGE)) {
+        throw error
+      }
+      if (
+        /not found|indexer|fetch|network|ECONN|timeout|no vtxos|no exitable/i.test(
+          message
+        )
+      ) {
+        throw new Error(
+          `Could not build the exit package. Open the wallet online once so Arkade can cache exit data, then try again. (${message})`
+        )
+      }
+      throw error
+    }
+
+    const json = serializeExitPackage(pkg)
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `edge-arkade-exit-${stamp}.json`
+    return {
+      json,
+      filename,
+      executorUrl: ARKADE_UNILATERAL_EXIT_EXECUTOR_URL,
+      mode: 'graph',
+      sweepAddress: destinationAddress
+    }
   }
 
   private async runUnilateralExitToAddress(
