@@ -2,14 +2,14 @@ import { Disklet } from 'disklet'
 
 import { safeArkadeWalletFileId } from './arkadeStoragePaths'
 
-export type UnrollChainTx = {
+export interface UnrollChainTx {
   txid: string
   expiresAt?: string
   type: string
   spends?: string[]
 }
 
-export type UnrollCachePayload = {
+export interface UnrollCachePayload {
   chains: Record<string, UnrollChainTx[]>
   virtualTxs: Record<string, string>
 }
@@ -34,6 +34,7 @@ export class ArkadeUnrollCache {
     chains: {},
     virtualTxs: {}
   }
+
   private memoryLoaded = false
   private queued: Promise<unknown> = Promise.resolve()
 
@@ -75,11 +76,17 @@ export class ArkadeUnrollCache {
     })
   }
 
-  async setVirtualTxs(entries: Array<{ txid: string; tx: string }>): Promise<void> {
+  async setVirtualTxs(
+    entries: Array<{ txid: string; tx: string }>
+  ): Promise<void> {
     await this.enqueue(async () => {
       await this.ensureLoaded()
       for (const { txid, tx } of entries) {
-        if (typeof txid === 'string' && typeof tx === 'string' && tx.length > 0) {
+        if (
+          typeof txid === 'string' &&
+          typeof tx === 'string' &&
+          tx.length > 0
+        ) {
           this.payload.virtualTxs[txid] = tx
         }
       }
@@ -104,11 +111,11 @@ export class ArkadeUnrollCache {
       this.payload = {
         chains:
           json.chains != null && typeof json.chains === 'object'
-            ? (json.chains as Record<string, UnrollChainTx[]>)
+            ? json.chains
             : {},
         virtualTxs:
           json.virtualTxs != null && typeof json.virtualTxs === 'object'
-            ? (json.virtualTxs as Record<string, string>)
+            ? json.virtualTxs
             : {}
       }
     } catch {
@@ -189,37 +196,90 @@ export function wrapIndexerWithUnrollCache(
       if (prop === 'getVirtualTxs') {
         return async (txids: string[], opts?: unknown) => {
           const ids = Array.isArray(txids) ? txids : []
-          try {
-            const result = await target.getVirtualTxs(ids, opts)
-            const txs: string[] = Array.isArray(result?.txs) ? result.txs : []
-            const entries: Array<{ txid: string; tx: string }> = []
-            for (let i = 0; i < ids.length; i++) {
-              const tx = txs[i]
-              if (typeof tx === 'string' && tx.length > 0) {
-                entries.push({ txid: ids[i], tx })
+          const found = new Map<string, string>()
+
+          const takeResult = (result: unknown, assumedIds: string[]): void => {
+            const txs: string[] = Array.isArray((result as any)?.txs)
+              ? (result as any).txs
+              : []
+            // Indexer / Unroll.Session align by request order when lengths match.
+            // Otherwise leave gaps for per-id refetch (avoid wrong id↔PSBT mapping).
+            if (txs.length === assumedIds.length) {
+              for (let i = 0; i < assumedIds.length; i++) {
+                const tx = txs[i]
+                if (
+                  typeof tx === 'string' &&
+                  tx.length > 0 &&
+                  !found.has(assumedIds[i])
+                ) {
+                  found.set(assumedIds[i], tx)
+                }
               }
+              return
             }
-            if (entries.length > 0) {
-              await cache.setVirtualTxs(entries)
+            if (
+              assumedIds.length === 1 &&
+              txs.length === 1 &&
+              typeof txs[0] === 'string' &&
+              txs[0].length > 0
+            ) {
+              found.set(assumedIds[0], txs[0])
             }
-            return result
-          } catch (error: unknown) {
-            const txs: string[] = []
-            for (const txid of ids) {
-              const cached = await cache.getVirtualTx(txid)
-              if (cached == null) {
-                const message =
-                  error instanceof Error ? error.message : String(error)
-                throw new Error(`${UNROLL_CACHE_MISS_MESSAGE} (${message})`)
-              }
-              txs.push(cached)
-            }
-            console.warn(
-              '[arkade] getVirtualTxs failed; using local unroll cache',
-              error
-            )
-            return { txs }
           }
+
+          let batchError: unknown
+          try {
+            takeResult(await target.getVirtualTxs(ids, opts), ids)
+          } catch (error: unknown) {
+            batchError = error
+          }
+
+          for (const txid of ids) {
+            if (found.has(txid)) continue
+            const cached = await cache.getVirtualTx(txid)
+            if (cached != null) {
+              found.set(txid, cached)
+              continue
+            }
+            // Batch responses often omit individual virtual txs (or fail the
+            // whole page on one bad PSBT). Single-id fetch matches Unroll.Session.
+            try {
+              takeResult(await target.getVirtualTxs([txid], opts), [txid])
+            } catch {
+              // keep trying remaining ids
+            }
+          }
+
+          const entries: Array<{ txid: string; tx: string }> = []
+          for (const [txid, tx] of found) {
+            entries.push({ txid, tx })
+          }
+          if (entries.length > 0) {
+            await cache.setVirtualTxs(entries)
+          }
+
+          const ordered = ids
+            .map(txid => found.get(txid))
+            .filter(
+              (tx): tx is string => typeof tx === 'string' && tx.length > 0
+            )
+
+          if (ordered.length === 0 && batchError != null) {
+            const message =
+              batchError instanceof Error
+                ? batchError.message
+                : String(batchError)
+            throw new Error(`${UNROLL_CACHE_MISS_MESSAGE} (${message})`)
+          }
+
+          if (ordered.length < ids.length && batchError != null) {
+            console.warn(
+              '[arkade] getVirtualTxs partial; using cache + per-id refetch',
+              batchError
+            )
+          }
+
+          return { txs: ordered, page: null }
         }
       }
 

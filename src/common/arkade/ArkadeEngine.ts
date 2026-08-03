@@ -2152,6 +2152,15 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         ? 'regtest'
         : 'testnet')
 
+    // UnilateralExit.prepare reads wallet.indexerProvider directly (no Disklet
+    // cache). Temporarily wrap it so batch misses fall back to cache + per-id
+    // refetch — same path Unroll.Session already uses.
+    const rawIndexer = wallet.indexerProvider
+    wallet.indexerProvider = wrapIndexerWithUnrollCache(
+      rawIndexer,
+      this.unrollCache
+    )
+
     const exitOpts = {
       wallet,
       onchainWallet,
@@ -2167,6 +2176,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       path?: string
       skipped?: string
     }
+
+    const isUneconomicSkip = (reason: string | undefined): boolean =>
+      reason != null && /uneconomic/i.test(reason)
 
     const summarizeSkipped = (infos: ExitVtxoRow[]): string => {
       const reasons = [
@@ -2199,6 +2211,14 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     let estimateFeeRate: number | undefined
 
     try {
+      // Warm chain + virtual PSBT cache before estimate/prepare (ignore throttle).
+      this.unrollPrefetchAt = 0
+      try {
+        await this.prefetchUnrollArtifacts(wallet)
+      } catch (error: unknown) {
+        console.warn('[arkade] exit-package prefetch failed', error)
+      }
+
       // Estimate first — surfaces per-VTXO skip reasons without the misleading
       // "cache exit data" rewrite used for real indexer/offline failures.
       const quote = await UnilateralExit.estimate(exitOpts)
@@ -2208,16 +2228,51 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       if (estimateInfos.length === 0) {
         throw new Error('No funds available to exit')
       }
-      if (estimateInfos.every(i => i.skipped != null && i.skipped !== '')) {
+
+      const allSkipped = estimateInfos.every(
+        i => i.skipped != null && i.skipped !== ''
+      )
+      const onlyUneconomic =
+        allSkipped && estimateInfos.every(i => isUneconomicSkip(i.skipped))
+      // Save JSON must still proceed when the only blocker is economics
+      // (fees > VTXO value). Non-economic skips remain fatal at estimate.
+      if (allSkipped && !onlyUneconomic) {
         throw new Error(summarizeSkipped(estimateInfos))
       }
 
-      // Pin feeRate so prepare cannot race a higher mempool rate and flip
-      // estimate-OK VTXOs into uneconomic/sign failures.
-      const pkg = await UnilateralExit.prepare({
-        ...exitOpts,
-        ...(estimateFeeRate != null ? { feeRate: estimateFeeRate } : {})
-      })
+      const feeRates: number[] = []
+      if (estimateFeeRate != null) feeRates.push(Math.ceil(estimateFeeRate))
+      if (!feeRates.includes(1)) feeRates.push(1)
+
+      let pkg: Awaited<ReturnType<typeof UnilateralExit.prepare>> | undefined
+      let lastError: unknown
+      for (const feeRate of feeRates) {
+        try {
+          pkg = await UnilateralExit.prepare({
+            ...exitOpts,
+            feeRate
+          })
+          lastError = undefined
+          break
+        } catch (error: unknown) {
+          lastError = error
+          const message = error instanceof Error ? error.message : String(error)
+          // Retry at lower feeRate when SDK still skips as uneconomic.
+          if (
+            /uneconomic|no exitable vtxos \(all skipped\)/i.test(message) &&
+            feeRate > 1
+          ) {
+            continue
+          }
+          throw error
+        }
+      }
+      if (pkg == null) {
+        throw lastError instanceof Error
+          ? lastError
+          : new Error(String(lastError ?? 'prepare failed'))
+      }
+
       const json = serializeExitPackage(pkg)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
       const filename = `edge-arkade-exit-${stamp}.json`
@@ -2260,7 +2315,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           parts.push(`feeRate=${estimateFeeRate} sat/vB.`)
         }
         parts.push(
-          'Typical causes: exit path requires additional signers, signing failed, or VTXO value below sweep fee + dust.'
+          'Typical causes: exit path requires additional signers or signing failed.'
         )
         throw new Error(parts.join(' '))
       }
@@ -2274,6 +2329,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         )
       }
       throw error
+    } finally {
+      wallet.indexerProvider = rawIndexer
     }
   }
 
