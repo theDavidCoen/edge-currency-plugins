@@ -2161,6 +2161,33 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       this.unrollCache
     )
 
+    // HD wallets rotate receive keys; SDK buildSignedSweep uses identity.sign
+    // (index-0 only) and silently produces unsigned sweeps for rotated VTXOs.
+    // Route signing through InputSignerRouter like settle/send.
+    const identity = wallet.identity
+    const originalSign = identity.sign.bind(identity)
+    const signerRouter = (wallet as { _signerRouter?: { sign: Function } })
+      ._signerRouter
+    if (signerRouter?.sign != null) {
+      identity.sign = async (tx: any, inputIndexes?: number[]) => {
+        if (inputIndexes != null) {
+          return originalSign(tx, inputIndexes)
+        }
+        const jobs: Array<{ index: number; lookupScript: Uint8Array }> = []
+        const inputCount = Number(tx?.inputsLength ?? 0)
+        for (let i = 0; i < inputCount; i++) {
+          const script = tx.getInput(i)?.witnessUtxo?.script
+          if (script != null) {
+            jobs.push({ index: i, lookupScript: script })
+          }
+        }
+        if (jobs.length === 0) {
+          return originalSign(tx)
+        }
+        return signerRouter.sign(tx, jobs)
+      }
+    }
+
     const exitOpts = {
       wallet,
       onchainWallet,
@@ -2315,7 +2342,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           parts.push(`feeRate=${estimateFeeRate} sat/vB.`)
         }
         parts.push(
-          'Typical causes: exit path requires additional signers or signing failed.'
+          'Typical causes: HD signing failed for rotated receive keys, exit path requires additional signers, or finalize failed.'
         )
         throw new Error(parts.join(' '))
       }
@@ -2330,6 +2357,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       }
       throw error
     } finally {
+      identity.sign = originalSign
       wallet.indexerProvider = rawIndexer
     }
   }
