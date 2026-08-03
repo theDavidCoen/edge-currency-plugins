@@ -1,22 +1,25 @@
-import { ArkadeSwaps, decodeInvoice, isValidArkAddress } from '@arkade-os/boltz-swap'
+import {
+  ArkadeSwaps,
+  decodeInvoice,
+  isValidArkAddress
+} from '@arkade-os/boltz-swap'
 import {
   ChainTxType,
   Estimator,
   MnemonicIdentity,
+  networks,
   OnchainWallet,
   RestDelegatorProvider,
-  Transaction,
+  serializeExitPackage,
   UnilateralExit,
   Unroll,
   VHTLC,
   VtxoScript,
-  WalletRepositoryImpl,
   Wallet,
-  networks,
-  serializeExitPackage
+  WalletRepositoryImpl
 } from '@arkade-os/sdk'
 import { TxWeightEstimator } from '@arkade-tx-size-estimator'
-import { base64, hex } from '@scure/base'
+import { hex } from '@scure/base'
 import { Address, OutScript, TaprootControlBlock } from '@scure/btc-signer'
 import {
   EdgeAddress,
@@ -34,6 +37,7 @@ import {
   EngineEvent,
   makeEngineEmitter
 } from '../plugin/EngineEmitter'
+import { ArkadeDiskletContractRepository } from './ArkadeDiskletContractRepository'
 import {
   arkadeCurrencyInfo,
   ArkadeSettings,
@@ -42,15 +46,18 @@ import {
   resolveDelegatorUrl
 } from './arkadeInfo'
 import { deriveLnurlSessionToken } from './arkadeLnurl'
-import { ArkadeDiskletContractRepository } from './ArkadeDiskletContractRepository'
 import { ArkadeDiskletSdkStorage } from './ArkadeSdkStorage'
 import { ArkadeDiskletSwapRepository } from './ArkadeSwapRepository'
+import {
+  asArkadePrivateKeys,
+  isBolt11Invoice,
+  isBtcOnchainAddress
+} from './arkadeTools'
 import {
   ArkadeUnrollCache,
   UNROLL_CACHE_MISS_MESSAGE,
   wrapIndexerWithUnrollCache
 } from './ArkadeUnrollCache'
-import { asArkadePrivateKeys, isBolt11Invoice, isBtcOnchainAddress } from './arkadeTools'
 
 type ArkadeDelayType = 'blocks' | 'seconds'
 
@@ -546,11 +553,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       try {
         await Promise.race([
           this.walletInitPromise,
-          new Promise((_resolve, reject) => {
-            setTimeout(
-              () => reject(new Error('Engine not started')),
-              timeoutMs
-            )
+          new Promise((resolve, reject) => {
+            void resolve
+            setTimeout(() => reject(new Error('Engine not started')), timeoutMs)
           })
         ])
       } catch {
@@ -588,9 +593,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
    * Edge calls this periodically when `unsafeSyncNetwork` is set, passing the
    * encrypted private keys. That is the only place we may read `arkadeMnemonic`.
    */
-  async syncNetwork(opts: {
-    privateKeys?: JsonObject
-  }): Promise<number> {
+  async syncNetwork(opts: { privateKeys?: JsonObject }): Promise<number> {
     if (!this.running) return POLL_MS
 
     try {
@@ -620,7 +623,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
                 ? { delegatorProvider: new RestDelegatorProvider(delegatorUrl) }
                 : {}),
               storage: {
-                walletRepository: new WalletRepositoryImpl(this.sdkStorage as any),
+                walletRepository: new WalletRepositoryImpl(
+                  this.sdkStorage as any
+                ),
                 contractRepository: new ArkadeDiskletContractRepository(
                   this.sdkStorage
                 ) as any
@@ -640,7 +645,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
             // first post-receive rotate() produces a *new* address instead of a
             // no-op that only changes after the second payment.
             try {
-              const provider = (this.wallet as any)?._descriptorProvider
+              const provider = this.wallet?._descriptorProvider
               if (
                 provider?.getLastIndexUsed != null &&
                 provider?.advanceLastIndexUsed != null
@@ -674,9 +679,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
 
             // Live incoming funds → refresh balance/txs for in-app receive dropdown
             try {
-              this.stopIncomingNotify = await this.wallet.notifyIncomingFunds(() => {
-                this.poll().catch(() => {})
-              })
+              this.stopIncomingNotify = await this.wallet.notifyIncomingFunds(
+                () => {
+                  this.poll().catch(() => {})
+                }
+              )
             } catch {
               // Optional SDK feature; polling still works.
             }
@@ -697,8 +704,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       this.emitter.emit(EngineEvent.ADDRESSES_CHECKED, 1)
     } catch (error) {
       // Surface to Edge core logs; keep retrying on the next tick.
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] syncNetwork failed: ${message}`)
       this.emitter.emit(EngineEvent.ADDRESSES_CHECKED, 0)
       throw error
@@ -748,8 +754,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     // ASP refresh can hang on slow networks; resync must return immediately so
     // the wallet menu spinner and sync ratio recover without waiting on poll().
     void this.poll().catch((error: unknown) => {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] resync poll failed: ${message}`)
     })
     this.emitter.emit(EngineEvent.ADDRESSES_CHECKED, 1)
@@ -930,8 +935,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       memos: spendInfo.memos ?? tx.memos,
       savedAction: spendInfo.savedAction ?? tx.savedAction,
       assetAction: spendInfo.assetAction ?? tx.assetAction,
-      tokenId:
-        spendInfo.tokenId !== undefined ? spendInfo.tokenId : tx.tokenId
+      tokenId: spendInfo.tokenId !== undefined ? spendInfo.tokenId : tx.tokenId
     }
   }
 
@@ -952,7 +956,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     if (isBolt11Invoice(to)) {
       await this.waitForSwapsReady()
       const decoded = decodeInvoice(to)
-      let amount =
+      const amount =
         decoded.amountSats > 0
           ? decoded.amountSats
           : Math.abs(Number(target.nativeAmount ?? 0))
@@ -963,7 +967,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         throw new Error('Insufficient funds')
       }
       const lightningFee = await this.tryEstimateLightningFee(amount)
-      if (amount + lightningFee > Number(this.cachedBalance)) {
+      if (Number(amount) + Number(lightningFee) > Number(this.cachedBalance)) {
         throw new Error('Insufficient funds')
       }
 
@@ -997,7 +1001,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     }
 
     // --- Arkade offchain address ---
-    if (isValidArkAddress(to)) {
+    if (isValidArkAddress(to) === true) {
       if (target.nativeAmount == null) throw new Error('Missing nativeAmount')
 
       const amount = Math.abs(Number(target.nativeAmount))
@@ -1315,11 +1319,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   }
 
   private async tryEstimateLightningFee(amountSats: number): Promise<number> {
-    if (
-      this.swaps == null ||
-      !Number.isFinite(amountSats) ||
-      amountSats <= 0
-    ) {
+    if (this.swaps == null || !Number.isFinite(amountSats) || amountSats <= 0) {
       return 0
     }
     try {
@@ -1377,7 +1377,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   private async getCachedSdkHistory(wallet: any): Promise<any[]> {
     try {
       const address = await wallet.getAddress()
-      const cached = await wallet.walletRepository?.getTransactionHistory?.(address)
+      const cached = await wallet.walletRepository?.getTransactionHistory?.(
+        address
+      )
       return Array.isArray(cached) ? cached : []
     } catch {
       return []
@@ -1437,7 +1439,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       ) {
         const limits = await this.swaps.getLimits('ARK', 'BTC')
         const fees = await this.swaps.getFees('ARK', 'BTC')
-        if (limits == null || fees?.percentage == null || fees.minerFees == null) {
+        if (
+          limits == null ||
+          fees?.percentage == null ||
+          fees.minerFees == null
+        ) {
           return null
         }
         this.boltzArkToBtcCache = {
@@ -1602,7 +1608,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     amount: bigint | undefined,
     feeInfo: unknown
   ): Promise<string> {
-    const wallet = await this.waitForWalletReady()
+    await this.waitForWalletReady()
     const { change, selected, sendAmount } = await this.prepareOnchainExit(
       destinationAddress,
       amount,
@@ -1618,7 +1624,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     // Match Arkade Wallet: change first when present.
     outputs.reverse()
 
-    return await this.wallet.settle({ inputs: selected, outputs })
+    return await Promise.resolve(
+      this.wallet.settle({ inputs: selected, outputs })
+    )
   }
 
   private estimateOnchainOutputFee(
@@ -1663,13 +1671,13 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       for (const vtxo of eligible) {
         const inputFee = estimator.evalOffchainInput({
           amount: BigInt(vtxo.value),
-          type:
-            vtxo.virtualStatus?.state === 'swept' ? 'recoverable' : 'vtxo',
+          type: vtxo.virtualStatus?.state === 'swept' ? 'recoverable' : 'vtxo',
           weight: 0,
           birth: vtxo.createdAt,
-          expiry: vtxo.virtualStatus?.batchExpiry
-            ? new Date(Number(vtxo.virtualStatus.batchExpiry))
-            : undefined
+          expiry:
+            vtxo.virtualStatus?.batchExpiry != null
+              ? new Date(Number(vtxo.virtualStatus.batchExpiry))
+              : undefined
         })
         if (BigInt(inputFee.satoshis) >= BigInt(vtxo.value)) continue
         selected.push(vtxo)
@@ -1700,9 +1708,10 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         type: vtxo.virtualStatus?.state === 'swept' ? 'recoverable' : 'vtxo',
         weight: 0,
         birth: vtxo.createdAt,
-        expiry: vtxo.virtualStatus?.batchExpiry
-          ? new Date(Number(vtxo.virtualStatus.batchExpiry))
-          : undefined
+        expiry:
+          vtxo.virtualStatus?.batchExpiry != null
+            ? new Date(Number(vtxo.virtualStatus.batchExpiry))
+            : undefined
       })
       if (BigInt(inputFee.satoshis) >= BigInt(vtxo.value)) continue
       selected.push(vtxo)
@@ -1775,7 +1784,13 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       // Offchain lockup avoids ASP SettlementMinExpiryGap.
       if (amount == null || !Number.isFinite(amount) || amount <= 0) {
         const boltzProbe = await this.tryResolveArkToBtcPath(
-          Math.max(1, Math.floor(Number(this.cachedBalance) / 2) || 1)
+          Math.max(
+            1,
+            (() => {
+              const half = Math.floor(Number(this.cachedBalance) / 2)
+              return Number.isFinite(half) && half !== 0 ? half : 1
+            })()
+          )
         )
         if (boltzProbe != null || this.swaps != null) {
           // Swaps initialized: typical swap amounts go via Boltz when in limits.
@@ -1821,11 +1836,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           feeInfo = info?.fees
         } catch {}
 
-        await this.prepareOnchainExit(
-          boardingAddress,
-          BigInt(amount),
-          feeInfo
-        )
+        await this.prepareOnchainExit(boardingAddress, BigInt(amount), feeInfo)
       }
 
       return { eligible: true, code: 'ok', message: '' }
@@ -1833,7 +1844,11 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       const message = this.formatOnchainExitError(error)
       const lower = message.toLowerCase()
 
-      if (/settlementminexpirygap|expiry too far in the future|too fresh/i.test(lower)) {
+      if (
+        /settlementminexpirygap|expiry too far in the future|too fresh/i.test(
+          lower
+        )
+      ) {
         return {
           eligible: false,
           code: 'settlement_min_expiry_gap',
@@ -2018,8 +2033,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         const exits = decoded.exitPaths()
         const exit =
           exits.find(
-            (path: { params: { timelock: { type: string; value?: bigint } } }) =>
-              path.params.timelock.type === 'blocks'
+            (path: {
+              params: { timelock: { type: string; value?: bigint } }
+            }) => path.params.timelock.type === 'blocks'
           ) ?? exits[0]
         const value = exit?.params?.timelock?.value
         if (value != null && value > BigInt(0) && value < BigInt(512)) {
@@ -2063,8 +2079,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       }
     }
 
-    const packageVsize =
-      ArkadeEngine.UNROLL_PARENT_VSIZE + childVsize
+    const packageVsize = ArkadeEngine.UNROLL_PARENT_VSIZE + childVsize
     const packages = ArkadeEngine.UNROLL_PACKAGES_PER_VTXO
     const vBytes = packageVsize * packages
     const feeSats = BigInt(Math.ceil(feeRate * vBytes))
@@ -2134,8 +2149,8 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       (wallet.network?.bech32 === 'bc'
         ? 'bitcoin'
         : wallet.network?.bech32 === 'bcrt'
-          ? 'regtest'
-          : 'testnet')
+        ? 'regtest'
+        : 'testnet')
 
     const exitOpts = {
       wallet,
@@ -2145,7 +2160,15 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       networkName
     }
 
-    const summarizeSkipped = (infos: Array<{ skipped?: string }>): string => {
+    interface ExitVtxoRow {
+      outpoint?: string
+      value?: number
+      sweepFee?: number
+      path?: string
+      skipped?: string
+    }
+
+    const summarizeSkipped = (infos: ExitVtxoRow[]): string => {
       const reasons = [
         ...new Set(
           infos
@@ -2159,19 +2182,42 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       return `All VTXOs were skipped: ${reasons.join('; ')}`
     }
 
+    const summarizeActive = (infos: ExitVtxoRow[]): string =>
+      infos
+        .filter(i => i.skipped == null || i.skipped === '')
+        .map(i => {
+          const out = i.outpoint ?? '?'
+          const value = i.value ?? '?'
+          const path = i.path ?? '?'
+          const fee = i.sweepFee ?? '?'
+          return `${out} value=${value} path=${path} sweepFee=${fee}`
+        })
+        .join('; ')
+
+    // Kept for prepare() failures that discard per-VTXO skip reasons.
+    let estimateInfos: ExitVtxoRow[] = []
+    let estimateFeeRate: number | undefined
+
     try {
       // Estimate first — surfaces per-VTXO skip reasons without the misleading
       // "cache exit data" rewrite used for real indexer/offline failures.
       const quote = await UnilateralExit.estimate(exitOpts)
-      const infos = Array.isArray(quote?.vtxos) ? quote.vtxos : []
-      if (infos.length === 0) {
+      estimateInfos = Array.isArray(quote?.vtxos) ? quote.vtxos : []
+      estimateFeeRate =
+        typeof quote?.feeRate === 'number' ? quote.feeRate : undefined
+      if (estimateInfos.length === 0) {
         throw new Error('No funds available to exit')
       }
-      if (infos.every(i => i.skipped != null && i.skipped !== '')) {
-        throw new Error(summarizeSkipped(infos))
+      if (estimateInfos.every(i => i.skipped != null && i.skipped !== '')) {
+        throw new Error(summarizeSkipped(estimateInfos))
       }
 
-      const pkg = await UnilateralExit.prepare(exitOpts)
+      // Pin feeRate so prepare cannot race a higher mempool rate and flip
+      // estimate-OK VTXOs into uneconomic/sign failures.
+      const pkg = await UnilateralExit.prepare({
+        ...exitOpts,
+        ...(estimateFeeRate != null ? { feeRate: estimateFeeRate } : {})
+      })
       const json = serializeExitPackage(pkg)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
       const filename = `edge-arkade-exit-${stamp}.json`
@@ -2191,9 +2237,32 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         throw error
       }
       if (/no exitable vtxos \(all skipped\)/i.test(message)) {
-        throw new Error(
-          'All VTXOs were skipped while building the exit package. Funds may be too small for network fees, or no unilateral exit path is available for these VTXOs.'
+        const active = summarizeActive(estimateInfos)
+        const skippedReasons = [
+          ...new Set(
+            estimateInfos
+              .map(i => i.skipped)
+              .filter((r): r is string => r != null && r !== '')
+          )
+        ]
+        const parts = [
+          'All VTXOs were skipped while building the exit package (sign/sweep failed after estimate).'
+        ]
+        if (active !== '') {
+          parts.push(`Estimated OK then failed: ${active}.`)
+        }
+        if (skippedReasons.length > 0) {
+          parts.push(
+            `Already skipped at estimate: ${skippedReasons.join('; ')}.`
+          )
+        }
+        if (estimateFeeRate != null) {
+          parts.push(`feeRate=${estimateFeeRate} sat/vB.`)
+        }
+        parts.push(
+          'Typical causes: exit path requires additional signers, signing failed, or VTXO value below sweep fee + dust.'
         )
+        throw new Error(parts.join(' '))
       }
       if (
         /not found|indexer|fetch|ECONN|timeout|Unroll data not cached|no vtxos to exit/i.test(
@@ -2243,12 +2312,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           wallet.onchainProvider,
           indexer
         )
-        for await (const _step of session) {
+        for await (const step of session) {
+          void step
           // Session iterator executes WAIT / UNROLL steps.
         }
       } catch (error: unknown) {
-        const message =
-          error instanceof Error ? error.message : String(error)
+        const message = error instanceof Error ? error.message : String(error)
         if (message.includes(UNROLL_CACHE_MISS_MESSAGE)) {
           throw error
         }
@@ -2266,10 +2335,13 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         vtxoTxids,
         destinationAddress
       )
-      return { txid: String(txid), destination: destinationAddress, phase: 'sweep' }
+      return {
+        txid: String(txid),
+        destination: destinationAddress,
+        phase: 'sweep'
+      }
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       if (
         /not fully unrolled|not confirmed|no available exit path|timelock/i.test(
           message
@@ -2378,7 +2450,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
   }
 
   private getOnchainOutputScript(destinationAddress: string): string {
-    for (const networkName of Object.keys(networks) as Array<keyof typeof networks>) {
+    for (const networkName of Object.keys(networks) as Array<
+      keyof typeof networks
+    >) {
       try {
         const addr = Address(networks[networkName]).decode(destinationAddress)
         return hex.encode(OutScript.encode(addr))
@@ -2386,7 +2460,9 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         continue
       }
     }
-    throw new Error(`Failed to decode destination address: ${destinationAddress}`)
+    throw new Error(
+      `Failed to decode destination address: ${destinationAddress}`
+    )
   }
 
   private stopLnurlSession(opts: { clearCached: boolean }): void {
@@ -2583,7 +2659,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
                 if (created.pendingSwap != null) {
                   this.swaps
                     .waitAndClaim(created.pendingSwap)
-                    .then(() => this.poll())
+                    .then(async () => await this.poll())
                     .catch(() => {})
                 }
               } catch (e) {
@@ -2602,11 +2678,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       } finally {
         this.lnurlLoopRunning = false
         // Reconnect with the same mnemonic token so the LNURL stays valid.
-        if (
-          this.running &&
-          this.swaps != null &&
-          this.lnurlAbort === abort
-        ) {
+        if (this.running && this.swaps != null && this.lnurlAbort === abort) {
           this.lnurlReconnectTimer = setTimeout(() => {
             this.ensureLnurlSession(lnurlServerUrl).catch(() => {})
           }, 2000)
@@ -2636,8 +2708,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       this.cachedArkadeAddress = nextArkadeAddress
       this.cachedBoardingAddress = nextBoardingAddress
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] refresh receive addresses failed: ${message}`)
     }
 
@@ -2653,8 +2724,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     try {
       balance = await this.wallet.getBalance()
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] getBalance failed: ${message}`)
       const fallbackBalance = await this.getFallbackBalance(this.wallet)
       if (fallbackBalance !== '0') {
@@ -2689,8 +2759,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       history = await this.wallet.getTransactionHistory()
       if (!Array.isArray(history)) history = []
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] getTransactionHistory failed: ${message}`)
       history = await this.getCachedSdkHistory(this.wallet)
     }
@@ -2732,8 +2801,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         knownBoarding.add(txid)
       }
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error)
       console.warn(`[arkade] getBoardingUtxos for history failed: ${message}`)
     }
 
@@ -2755,14 +2823,17 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       const arkTxid = String(h.key?.arkTxid ?? '')
       const commitmentTxid = String(h.key?.commitmentTxid ?? '')
       let txid = String(
-        arkTxid ||
-          commitmentTxid ||
-          boardingTxid ||
-          `ark-${h.type}-${h.createdAt}-${h.amount}`
+        arkTxid !== ''
+          ? arkTxid
+          : commitmentTxid !== ''
+          ? commitmentTxid
+          : boardingTxid !== ''
+          ? boardingTxid
+          : `ark-${h.type}-${h.createdAt}-${h.amount}`
       )
       // Defensive: never surface raw Boltz swap ids as Edge txids.
       if (this.looksLikeBoltzSwapId(txid)) {
-        const fallback = commitmentTxid || boardingTxid
+        const fallback = commitmentTxid !== '' ? commitmentTxid : boardingTxid
         if (fallback !== '' && !this.looksLikeBoltzSwapId(fallback)) {
           txid = fallback
         } else {
@@ -2807,9 +2878,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
           : Math.floor(createdAtMs / 1000)
 
       const boltzSwapId =
-        boltzByFundTxid.get(txid) ??
-        boltzByFundTxid.get(arkTxid) ??
-        undefined
+        boltzByFundTxid.get(txid) ?? boltzByFundTxid.get(arkTxid) ?? undefined
 
       const transaction: EdgeTransaction = {
         // Only mempool boarding stays height 0 → Edge "Pending".
@@ -2822,9 +2891,7 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         isSend,
         memos: [],
         metadata:
-          boltzSwapId != null
-            ? { notes: `Boltz: ${boltzSwapId}` }
-            : undefined,
+          boltzSwapId != null ? { notes: `Boltz: ${boltzSwapId}` } : undefined,
         nativeAmount,
         networkFee: '0',
         networkFees: [],
@@ -2860,11 +2927,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
     // If drain left the address unchanged, force one additional exclusive
     // rotate so Receive advances after the first incoming funds.
     const hasNewReceive = events.some(
-      e => e.isNew && !e.transaction.isSend && e.transaction.nativeAmount !== '0'
+      e =>
+        e.isNew && !e.transaction.isSend && e.transaction.nativeAmount !== '0'
     )
     if (hasNewReceive) {
       try {
-        const rotator = (this.wallet as any)?._receiveRotator
+        const rotator = this.wallet?._receiveRotator
         const beforeArkade = this.cachedArkadeAddress
         if (rotator?.drain != null) {
           await rotator.drain()
@@ -2957,13 +3025,12 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         if (!Number.isFinite(lockAmount) || lockAmount <= 0) continue
         // Prefer SENT rows whose amount matches the lockup.
         const match = history.find(
-          (h: any) =>
-            h.type === 'SENT' && Number(h.amount) === lockAmount
+          (h: any) => h.type === 'SENT' && Number(h.amount) === lockAmount
         )
         if (match == null) continue
         const arkTxid = String(match.key?.arkTxid ?? '')
         const commitmentTxid = String(match.key?.commitmentTxid ?? '')
-        const txid = arkTxid || commitmentTxid
+        const txid = arkTxid !== '' ? arkTxid : commitmentTxid
         if (txid !== '') out.set(txid, swapId)
       }
     } catch (error: unknown) {
