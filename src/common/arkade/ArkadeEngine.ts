@@ -2129,22 +2129,74 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
       wallet.onchainProvider
     )
 
-    let pkg
+    const networkName =
+      wallet.networkName ??
+      (wallet.network?.bech32 === 'bc'
+        ? 'bitcoin'
+        : wallet.network?.bech32 === 'bcrt'
+          ? 'regtest'
+          : 'testnet')
+
+    const exitOpts = {
+      wallet,
+      onchainWallet,
+      sweepAddress: destinationAddress,
+      mode: 'graph' as const,
+      networkName
+    }
+
+    const summarizeSkipped = (infos: Array<{ skipped?: string }>): string => {
+      const reasons = [
+        ...new Set(
+          infos
+            .map(i => i.skipped)
+            .filter((r): r is string => r != null && r !== '')
+        )
+      ]
+      if (reasons.length === 0) {
+        return 'All VTXOs were skipped (no unilateral exit path available).'
+      }
+      return `All VTXOs were skipped: ${reasons.join('; ')}`
+    }
+
     try {
-      pkg = await UnilateralExit.prepare({
-        wallet,
-        onchainWallet,
-        sweepAddress: destinationAddress,
+      // Estimate first — surfaces per-VTXO skip reasons without the misleading
+      // "cache exit data" rewrite used for real indexer/offline failures.
+      const quote = await UnilateralExit.estimate(exitOpts)
+      const infos = Array.isArray(quote?.vtxos) ? quote.vtxos : []
+      if (infos.length === 0) {
+        throw new Error('No funds available to exit')
+      }
+      if (infos.every(i => i.skipped != null && i.skipped !== '')) {
+        throw new Error(summarizeSkipped(infos))
+      }
+
+      const pkg = await UnilateralExit.prepare(exitOpts)
+      const json = serializeExitPackage(pkg)
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const filename = `edge-arkade-exit-${stamp}.json`
+      return {
+        json,
+        filename,
+        executorUrl: ARKADE_UNILATERAL_EXIT_EXECUTOR_URL,
         mode: 'graph',
-        networkName: wallet.networkName
-      })
+        sweepAddress: destinationAddress
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
       if (message.includes(UNROLL_CACHE_MISS_MESSAGE)) {
         throw error
       }
+      if (/^All VTXOs were skipped|^No funds available/i.test(message)) {
+        throw error
+      }
+      if (/no exitable vtxos \(all skipped\)/i.test(message)) {
+        throw new Error(
+          'All VTXOs were skipped while building the exit package. Funds may be too small for network fees, or no unilateral exit path is available for these VTXOs.'
+        )
+      }
       if (
-        /not found|indexer|fetch|network|ECONN|timeout|no vtxos|no exitable/i.test(
+        /not found|indexer|fetch|ECONN|timeout|Unroll data not cached|no vtxos to exit/i.test(
           message
         )
       ) {
@@ -2153,17 +2205,6 @@ export class ArkadeEngine implements EdgeCurrencyEngine {
         )
       }
       throw error
-    }
-
-    const json = serializeExitPackage(pkg)
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const filename = `edge-arkade-exit-${stamp}.json`
-    return {
-      json,
-      filename,
-      executorUrl: ARKADE_UNILATERAL_EXIT_EXECUTOR_URL,
-      mode: 'graph',
-      sweepAddress: destinationAddress
     }
   }
 
