@@ -14,6 +14,11 @@ import urlParse from 'url-parse'
 
 import { parsePathname } from '../utxobased/engine/utils'
 import {
+  extendedImportToWalletKeys,
+  parseExtendedImport,
+  parseExtendedImportOpts
+} from '../utxobased/import/extendedImport'
+import {
   asPrivateKey,
   asPublicKey,
   asSafeWalletInfo,
@@ -41,17 +46,37 @@ export function makeCurrencyTools(
 
   const fns: EdgeCurrencyTools = {
     async checkPublicKey(publicKeyData: JsonObject): Promise<boolean> {
-      const publicKey = asMaybe(asPublicKey)(publicKeyData)
+      // derivePublicKey may attach `watchOnly` beside `publicKeys`; strip it
+      // before validating the xpub map.
+      const { watchOnly, ...rest } = publicKeyData
+      const publicKey = asMaybe(asPublicKey)(rest)
 
       if (publicKey == null) return false
 
       const privateKeyFormat = inferPrivateKeyFormat(publicKey)
       const supportedFormats = getSupportedFormats(engineInfo, privateKeyFormat)
 
-      // Public must have an defined xpub for every supported format
-      return supportedFormats.every(
+      // Watch-only imports often provide a single format (e.g. zpub → bip84).
+      // Accept the cache when at least one supported format is present.
+      const presentFormats = supportedFormats.filter(
         format => publicKey.publicKeys[format] != null
       )
+      if (presentFormats.length === 0) return false
+
+      // Force a re-derive for bip84-only caches that predate the watchOnly
+      // flag so the GUI can detect watch-only wallets.
+      const pubs = publicKey.publicKeys
+      if (
+        watchOnly !== true &&
+        pubs.bip84 != null &&
+        pubs.bip49 == null &&
+        pubs.bip44 == null &&
+        pubs.bip32 == null
+      ) {
+        return false
+      }
+
+      return true
     },
 
     async createPrivateKey(
@@ -74,27 +99,31 @@ export function makeCurrencyTools(
       entropy: string,
       opts?: JsonObject
     ): Promise<JsonObject> {
-      const isMnemonic = bip39.validateMnemonic(entropy)
+      const importOpts = parseExtendedImportOpts(opts)
+      const format =
+        importOpts.format ?? opts?.format ?? engineInfo.formats?.[0] ?? 'bip44'
+      const coinType =
+        importOpts.coinType ?? opts?.coinType ?? coinInfo.coinType ?? 0
 
-      // Handle error case(s) if not a valid form of entropy
-      if (!isMnemonic) {
-        // An Airbitz seed is a 256 bit base64 encoded string. Convert the string
-        // to a buffer and then count the bytes (32 bytes is 256 bits).
+      try {
+        const parsed = parseExtendedImport(entropy, {
+          ...opts,
+          keyOptions: {
+            ...(opts?.keyOptions as JsonObject | undefined),
+            format,
+            coinType,
+            ...importOpts
+          }
+        })
+        return extendedImportToWalletKeys(parsed, coinInfo.name, coinType)
+      } catch (e) {
+        // Preserve legacy Airbitz error message for callers/tests.
         const isAirbitzSeed = Buffer.from(entropy, 'base64').length === 32
         if (isAirbitzSeed) {
           throw new Error('Import for Airbitz seeds is unsupported.')
         }
-        throw new Error('Invalid mnemonic')
+        throw e
       }
-
-      const privateKey: PrivateKey = {
-        imported: true,
-        seed: entropy,
-        format: opts?.format ?? engineInfo.formats?.[0] ?? 'bip44',
-        coinType: opts?.coinType ?? coinInfo.coinType ?? 0
-      }
-
-      return wasCurrencyPrivateKey(privateKey)
     },
 
     async derivePublicKey(
@@ -103,7 +132,16 @@ export function makeCurrencyTools(
       // Use the safety cleaner to derive the public keys from the
       // unsafeWalletInfo which contains the private key.
       const safeWalletInfo = asCurrencySafeWalletInfo(unsafeWalletInfo)
-      return safeWalletInfo.keys.publicKey
+      // Persist watchOnly on the public key cache so the GUI can detect
+      // xpub-imported wallets via wallet.publicWalletInfo.keys.watchOnly
+      // (private keys are not exposed to React Native).
+      const watchOnly =
+        safeWalletInfo.keys.watchOnly === true ||
+        unsafeWalletInfo.keys.watchOnly === true
+      return {
+        ...safeWalletInfo.keys.publicKey,
+        ...(watchOnly ? { watchOnly: true } : {})
+      }
     },
 
     async parseUri(uri: string): Promise<ExtendedParseUri> {

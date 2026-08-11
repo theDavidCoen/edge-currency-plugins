@@ -116,6 +116,7 @@ export interface SeedOrMnemonicToXPrivArgs {
   coinType?: number // defaults to the coin type as defined in the coin class
   account?: number // defaults to account 0'
   coin: string
+  seedType?: string
 }
 
 export interface XPrivToXPubArgs {
@@ -372,7 +373,6 @@ export const getAddressTypeFromAddress = (
 }
 
 export function seedOrMnemonicToXPriv(args: SeedOrMnemonicToXPrivArgs): string {
-  // match hexadecimal number from beginning to end of string
   const isMnemonic = args.seed.includes(' ')
   const seed = isMnemonic
     ? bip39.mnemonicToSeedSync(args.seed)
@@ -389,6 +389,26 @@ export function seedOrMnemonicToXPriv(args: SeedOrMnemonicToXPrivArgs): string {
   const bip32FromSeedFunc = coin.bip32FromSeedFunc ?? bip32.fromSeed
   const root: bip32.BIP32Interface = bip32FromSeedFunc(seed)
   root.network = network
+
+  // Electrum seeds derive addresses from the master key (m/change/index).
+  if (args.seedType === 'electrum') {
+    return root.toBase58()
+  }
+
+  // Pre-derived BIP39 / SLIP39 / aezeed seeds are stored as base64 bytes.
+  if (
+    !isMnemonic &&
+    (args.seedType === 'bip39' ||
+      args.seedType === 'slip39' ||
+      args.seedType === 'aezeed')
+  ) {
+    return root
+      .deriveHardened(purpose)
+      .deriveHardened(coinType)
+      .deriveHardened(account)
+      .toBase58()
+  }
+
   // treat a detected seed as an airbitz seed
   return purpose === 32 || !isMnemonic
     ? root.derive(0).toBase58()

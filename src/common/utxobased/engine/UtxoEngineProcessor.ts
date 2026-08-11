@@ -25,7 +25,7 @@ import {
   TransactionData,
   UtxoData
 } from '../db/types'
-import { getSupportedFormats, SafeWalletInfo } from '../keymanager/cleaners'
+import { SafeWalletInfo } from '../keymanager/cleaners'
 import {
   BIP43PurposeTypeEnum,
   derivationLevelScriptHash,
@@ -378,10 +378,23 @@ export function makeUtxoEngineProcessor(
       branch = 0,
       forceIndex
     }): Promise<EdgeFreshAddress> {
-      const { privateKeyFormat } = walletInfo.keys
+      const { privateKeyFormat, publicKey, walletFormats } = walletInfo.keys
 
       // Airbitz wallets only use branch 0
       if (privateKeyFormat === 'bip32') branch = 0
+
+      // Watch-only imports (e.g. zpub) may only provide a subset of formats.
+      // Never ask for an xpub we do not have — privateKeyFormat alone can be
+      // bip49 for bip84-only keys so getSupportedFormats still works.
+      const formatsWithXpub = walletFormats.filter(
+        format => publicKey.publicKeys[format] != null
+      )
+      if (formatsWithXpub.length === 0) {
+        throw new Error('Missing wallet public keys')
+      }
+      const primaryFormat = formatsWithXpub.includes(privateKeyFormat)
+        ? privateKeyFormat
+        : formatsWithXpub[0]
 
       const {
         address: publicAddress,
@@ -390,7 +403,7 @@ export function makeUtxoEngineProcessor(
       } = await internalGetFreshAddress(common, {
         forceIndex,
         changePath: {
-          format: privateKeyFormat,
+          format: primaryFormat,
           changeIndex: branch
         }
       })
@@ -406,14 +419,10 @@ export function makeUtxoEngineProcessor(
           legacyAddress !== publicAddress ? nativeBalance : undefined
       }
 
-      // Exclude the privateKeyFormat because it's covered by 'publicAddress'
-      const supportedFormats = getSupportedFormats(
-        pluginInfo.engineInfo,
-        walletInfo.keys.privateKeyFormat
-      ).filter(format => format !== privateKeyFormat)
-
-      // Loop over all other supported formats for their equivalent address:
-      for (const format of supportedFormats) {
+      // Fill complementary formats when their xpubs are present (e.g. bip84
+      // segwitAddress alongside a bip49 primary).
+      for (const format of formatsWithXpub) {
+        if (format === primaryFormat) continue
         if (format === 'bip84') {
           const {
             address,

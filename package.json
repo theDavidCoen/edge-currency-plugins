@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@bitcoinerlab/secp256k1": "^1.2.0",
+    "aezeed": "^0.0.5",
     "altcoin-js": "^1.0.0",
     "async-mutex": "^0.2.6",
     "baselet": "^0.3.0",
@@ -58,7 +59,9 @@
     "disklet": "^0.4.5",
     "ecpair": "npm:@edge.app/ecpair@2.1.0-edge.1",
     "edge-sync-client": "^0.2.7",
+    "electrum-mnemonic": "^2.0.0",
     "memlet": "^0.1.7",
+    "slip39": "^0.1.9",
     "uri-js": "^4.4.0",
     "url-parse": "^1.5.2",
     "wif-smart": "^2.0.0",

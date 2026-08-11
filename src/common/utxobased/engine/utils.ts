@@ -180,7 +180,8 @@ export const deriveXprivFromKeys = (args: {
   const xprivArgs = {
     seed: args.privateKey.seed,
     coinType: args.privateKey.coinType,
-    coin: args.coin
+    coin: args.coin,
+    seedType: args.privateKey.seedType
   }
   const walletPurpose = currencyFormatToPurposeType(args.privateKey.format)
   if (

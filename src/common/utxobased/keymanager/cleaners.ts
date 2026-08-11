@@ -34,11 +34,17 @@ const asOptionalPrivateKeyFormat = asOptional(asPrivateKeyFormat, 'bip32')
  *
  * (spec: https://github.com/EdgeApp/edge-core-js/blob/master/docs/key-formats.md)
  */
+export type ImportSeedType = 'bip39' | 'electrum' | 'aezeed' | 'slip39'
+
+const asImportSeedType = asValue('bip39', 'electrum', 'aezeed', 'slip39')
+
 export interface PrivateKey {
   coinType: number
   format: PrivateKeyFormat
   imported?: boolean
   seed: string // rename of seed/mnemonic (i.e. bitcoinKey, litecoinKey, etc)
+  seedType?: ImportSeedType
+  passphraseUsed?: boolean
 }
 export function asPrivateKey(
   coinName: string,
@@ -53,15 +59,26 @@ export function asPrivateKey(
         coinType: asOptional(asNumber, coinType),
         format: asOptionalPrivateKeyFormat,
         imported: asOptional(asBoolean),
+        seedType: asOptional(asImportSeedType),
+        passphraseUsed: asOptional(asBoolean),
         seed: asString
       })({ ...raw, seed: raw[`${coinName}Key`] })
     },
     clean => {
-      const { coinType, format, imported, seed } = clean
+      const {
+        coinType,
+        format,
+        imported,
+        seed,
+        seedType,
+        passphraseUsed
+      } = clean
       return {
         coinType,
         format,
         imported,
+        seedType,
+        passphraseUsed,
         [`${coinName}Key`]: seed
       }
     }
@@ -120,7 +137,14 @@ export const inferPrivateKeyFormat = (
   for (const [format, xpub] of Object.entries(publicKey.publicKeys)) {
     if (xpub != null) supportedFormats.push(format as CurrencyFormat)
   }
-  if (supportedFormats.includes('bip49')) return 'bip49'
+  // bip84-only watch-only keys (zpub) use the bip49 private-key format so
+  // getSupportedFormats also unlocks bip84 address derivation.
+  if (
+    supportedFormats.includes('bip49') ||
+    supportedFormats.includes('bip84')
+  ) {
+    return 'bip49'
+  }
   if (supportedFormats.includes('bip44')) return 'bip44'
   if (supportedFormats.includes('bip32')) return 'bip32'
   return 'bip32'
@@ -149,6 +173,7 @@ export interface SafeWalletInfo {
   type: string
   keys: {
     imported?: boolean
+    watchOnly?: boolean
     privateKeyFormat: PrivateKeyFormat
     publicKey: PublicKey
     walletFormats: CurrencyFormat[]
@@ -186,6 +211,7 @@ export const asSafeWalletInfo = (
         id,
         type,
         keys: {
+          watchOnly: walletInfo.keys.watchOnly === true,
           privateKeyFormat,
           walletFormats,
           publicKey
@@ -206,6 +232,7 @@ export const asSafeWalletInfo = (
         id,
         type,
         keys: {
+          watchOnly: walletInfo.keys.watchOnly === true,
           privateKeyFormat: privateKey.format,
           walletFormats,
           publicKey: { publicKeys: publicKey }
